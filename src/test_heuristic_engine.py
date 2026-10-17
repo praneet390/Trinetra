@@ -754,73 +754,9 @@ def test_handle_process_create_dedup_end_to_end():
     assert abs(engine.process_scores[pid] - 75) < 0.01
 
 
-# ---- Score Breakdown: attribution of every point ---------------------------
+# ---- Alert-time evidence: activity anchor lifecycle ------------------------
 
-def test_score_breakdown_attributes_components():
-    engine = HeuristicEngine()
-    pid = fresh_pid()
-    # Two distinct checks on one PID (no dedup key: plain dispatches).
-    # Image names are kept basename-portable ('powershell.exe' has no path)
-    # so the rule's host-name match works on both Windows and POSIX test
-    # hosts - the point here is breakdown attribution, not path matching.
-    engine._handle_process_create({'ProcessId': pid, 'Image': r'C:\Temp\evil.exe'})
-    engine._handle_process_create({'ProcessId': pid, 'Image': 'powershell.exe',
-                                   'CommandLine': 'powershell -enc aGk='})
-    breakdown = engine.score_breakdown(pid)
-    assert breakdown is not None
-    by_id = {c['check_id']: c for c in breakdown['components']}
-    assert by_id['staging_dir']['points'] == 30
-    assert by_id['powershell_abuse']['points'] == 45
-    # Live total = sum of the raw contributions on a fresh engine (no decay
-    # has elapsed yet), and the shares must sum to ~100%.
-    assert abs(breakdown['total'] - 75) < 0.01
-    assert abs(sum(c['share'] for c in breakdown['components']) - 100.0) < 0.1
-    assert breakdown['raw_sum'] == 75
-    # Every component carries its most recent reason text.
-    assert 'staging directory' in by_id['staging_dir']['context']
-    assert breakdown['activity_span_seconds'] is not None
-
-
-def test_score_breakdown_repeated_hits_accumulate_points_and_hits():
-    engine = HeuristicEngine()
-    pid = fresh_pid()
-    engine._add_score(pid, 10, 'benign-ish repeated signal', check_id='repeat_probe')
-    engine._add_score(pid, 10, 'benign-ish repeated signal', check_id='repeat_probe')
-    engine._add_score(pid, 10, 'benign-ish repeated signal', check_id='repeat_probe')
-    breakdown = engine.score_breakdown(pid)
-    (component,) = breakdown['components']
-    assert component['points'] == 30  # merged, not three rows
-    assert component['hits'] == 3
-
-
-def test_score_breakdown_unknown_pid_returns_none():
-    engine = HeuristicEngine()
-    assert engine.score_breakdown(fresh_pid()) is None
-
-
-def test_score_breakdown_survives_total_decay():
-    # Components are HISTORY: even after the live score decays to ~0, the
-    # breakdown still explains where the points came from - that is the
-    # 'analysts never see an unexplained number' contract.
-    engine = HeuristicEngine(config={'thresholds': {'warning': 10 ** 9, 'critical': 10 ** 9},
-                                     'decay_points_per_second': 1000.0,
-                                     'ransomware': {'file_event_window_seconds': 20, 'file_event_threshold': 60},
-                                     'correlator': {'fuse_window_seconds': 2.0},
-                                     'self_test': {'interval_seconds': 300, 'timeout_seconds': 15}})
-    pid = fresh_pid()
-    engine._add_score(pid, 30, 'staging dir', check_id='staging_dir')
-    time.sleep(0.02)  # let the aggressive decay window elapse
-    # Decay is LAZY in this engine - it is applied on the next scoring
-    # event for the PID, not by a background timer (see _apply_decay's
-    # docstring). Trigger the real decay path the way a real event would.
-    engine._apply_decay(pid)
-    breakdown = engine.score_breakdown(pid)
-    assert breakdown['total'] < 30  # decayed
-    assert breakdown['components'][0]['points'] == 30  # history intact
-    assert breakdown['components'][0]['check_id'] == 'staging_dir'
-
-
-def test_components_cleared_on_pid_reuse():
+def test_activity_anchor_cleared_on_pid_reuse():
     engine = HeuristicEngine()
     pid = fresh_pid()
     engine._add_score(pid, 30, 'staging dir', check_id='staging_dir')
@@ -834,13 +770,12 @@ def test_components_cleared_on_pid_reuse():
     try:
         engine._pid_start_times[pid] = 0.0  # different start time -> reuse
         engine._reset_score_if_pid_reused(pid)
-        assert pid not in engine.score_components
         assert pid not in engine.score_first_seen
     finally:
         psutil.Process = real_create
 
 
-def test_components_cleared_after_mitigation_snapshot_survives():
+def test_activity_anchor_cleared_after_mitigation_snapshot_survives():
     engine = HeuristicEngine()
     pid = fresh_pid()
     engine._add_score(pid, 90, 'Defender tampering', check_id='defender_tamper')
@@ -850,8 +785,7 @@ def test_components_cleared_after_mitigation_snapshot_survives():
     snapshot = engine.forensic_snapshots[pid]
     assert snapshot['trigger'] == 'critical_threshold'
     assert snapshot['score_at_capture'] == 90
-    assert snapshot['components_at_capture'][0]['check_id'] == 'defender_tamper'
-    assert pid not in engine.score_components
+    assert pid not in engine.score_first_seen
 
 
 # ---- Memory Ancestry Graph: detection-time forensic snapshots --------------
@@ -936,7 +870,9 @@ def test_forensic_snapshot_provider_failure_degrades_not_raises():
 def test_process_access_edge_labels_the_snapshot():
     # The Windows analog of the MMAP(RWX) edge: an untrusted process
     # opening LSASS with dangerous rights records an access edge, and the
-    # actor's forensic snapshot carries it as trigger_edge.
+    # actor's forensic snapshot carries it as trigger_edge - with BOTH the
+    # raw OpenProcess(mask) observation label and the syscall-family label
+    # the mask implies (VM_WRITE present -> MMAP(RWX)).
     engine = HeuristicEngine()
     engine.ancestry_provider = _fake_ancestry
     actor = fresh_pid()
@@ -952,31 +888,50 @@ def test_process_access_edge_labels_the_snapshot():
     # label carries the lowercased mask - identical text to what the
     # finding's context string shows the analyst.
     assert edge['label'] == 'OpenProcess(0x143a)'
+    assert edge['syscall'] == 'MMAP(RWX)'
     assert edge['to'] == 700
-    # And the breakdown panel attributes the points to the right check.
-    by_id = {c['check_id']: c for c in engine.score_breakdown(actor)['components']}
-    assert by_id['lsass_access']['points'] == 70
+    # The access edge must ALSO be merged into the ancestry's edge list
+    # (kind='access') so the reconstructed attack chain is one graph:
+    # birth edges (EXEC) plus the injection edge.
+    ancestry_edges = engine.forensic_snapshots[actor]['ancestry']['edges']
+    access_edges = [e for e in ancestry_edges if e.get('kind') == 'access']
+    assert len(access_edges) == 1
+    assert access_edges[0]['syscall'] == 'MMAP(RWX)'
+    assert access_edges[0]['to'] == 700
 
 
-def test_component_store_is_bounded():
+def test_access_edge_syscall_label_follows_the_rights_mask():
+    # The syscall vocabulary on access edges, derived from the granted
+    # rights: VM_WRITE or ALL_ACCESS -> MMAP(RWX) (can map/write executable
+    # memory into the victim); CREATE_THREAD without write -> CREATETHREAD
+    # (remote-thread primitive); anything else stays an honest raw
+    # OpenProcess(mask) with no injection claim.
     engine = HeuristicEngine()
+    cases = [
+        ('0x0020', 'MMAP(RWX)'),      # PROCESS_VM_WRITE alone
+        ('0x143A', 'MMAP(RWX)'),      # dump/inject combo carrying VM_WRITE
+        ('0x1FFFFF', 'MMAP(RWX)'),    # PROCESS_ALL_ACCESS
+        ('0x0002', 'CREATETHREAD'),   # CREATE_THREAD only
+        ('0x0010', 'OpenProcess(0x0010)'),  # VM_READ only - reads, not writes
+    ]
+    actor = fresh_pid()
+    for i, (mask, expected) in enumerate(cases):
+        engine._record_access_edge(actor, 900 + i, f'target{i}.exe', mask)
+        edge = engine._access_edge_for(actor)
+        assert edge['syscall'] == expected, f"mask {mask} must label as {expected}"
+
+
+def test_snapshot_without_access_edge_has_no_connection_note():
+    # A chain-only detection (no process-access event ever seen for this
+    # PID) must not invent a connection edge - the ancestry is births only,
+    # all labeled EXEC, and the forensic log line carries no edge note.
+    engine = HeuristicEngine()
+    engine.ancestry_provider = _fake_ancestry
     pid = fresh_pid()
-    for i in range(he.MAX_COMPONENTS_PER_PID + 10):
-        engine._add_score(pid, 0.1, f'check {i}', check_id=f'check_{i}')
-    assert len(engine.score_components[pid]) <= he.MAX_COMPONENTS_PER_PID
-
-
-def test_static_breakdown_attributes_checks():
-    engine = HeuristicEngine()
-    engine.add_static_score('a' * 64, 30, 'RWX section', check_id='rwx_section')
-    engine.add_static_score('a' * 64, 45, 'AMSI bypass', check_id='amsi_bypass_iat')
-    breakdown = engine.static_breakdown('a' * 64)
-    by_id = {c['check_id']: c for c in breakdown['components']}
-    assert by_id['rwx_section']['points'] == 30
-    assert by_id['amsi_bypass_iat']['points'] == 45
-    assert abs(breakdown['total'] - 75) < 0.01
-    assert abs(sum(c['share'] for c in breakdown['components']) - 100.0) < 0.1
-    assert engine.static_breakdown('b' * 64) is None
+    engine._add_score(pid, 90, 'Defender tampering', check_id='defender_tamper')
+    snapshot = engine.forensic_snapshots[pid]
+    assert snapshot['trigger_edge'] is None
+    assert all(e['label'] == 'EXEC' for e in snapshot['ancestry']['edges'])
 
 
 if __name__ == "__main__":

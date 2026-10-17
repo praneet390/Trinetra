@@ -189,20 +189,10 @@ PROTECTED_PIDS = frozenset({0, 4})
 DEDUP_MAX_ENTRIES = 2000
 
 # ---------------------------------------------------------------------------
-# Detection-forensics bounds. All four stores below follow the same bounded-
+# Detection-forensics bounds. Both stores below follow the same bounded-
 # eviction discipline as every other buffer in this codebase - a long-lived
 # engine must never grow without limit, no matter how noisy the host is.
 # ---------------------------------------------------------------------------
-
-# Per-PID score-component records (see _add_score): one entry per distinct
-# check that has ever contributed points to this PID. Repeats of the same
-# check MERGE into their existing entry (accumulating points/hits), so the
-# count is bounded by the number of distinct checks, not by event volume.
-MAX_COMPONENTS_PER_PID = 64
-
-# Per-file-hash static score components (see add_static_score) - same merge
-# discipline as the per-PID store, keyed by SHA-256.
-MAX_COMPONENTS_PER_HASH = 64
 
 # Forensic ancestry snapshots (see _capture_forensic_snapshot): one per PID
 # that ever crossed the warning or critical threshold. Snapshots are
@@ -214,8 +204,12 @@ MAX_FORENSIC_SNAPSHOTS = 100
 # Recent process-access edges (see _handle_process_access): "which process
 # opened which OTHER process with which rights, recently". These label the
 # non-parental connection edges in a forensic snapshot - the Windows analog
-# of the ancestry graph's "MMAP(RWX)"-style edge: parentage says how a
-# process was BORN, an access edge says what it TOUCHED.
+# of the ancestry graph's MMAP(RWX)-style edge: parentage says how a
+# process was BORN, an access edge says what it TOUCHED. The syscall label
+# on such an edge (see _record_access_edge) names the connection primitive
+# the granted rights imply - MMAP(RWX) for rights that allow executable
+# memory to be mapped into the victim, CREATETHREAD for remote-thread
+# injection, OpenProcess(mask) for anything less specific.
 MAX_ACCESS_EDGES = 200
 
 
@@ -332,21 +326,11 @@ class HeuristicEngine:
         # recorded about the scores the engine already produces.
         # -----------------------------------------------------------------
 
-        # pid -> OrderedDict(check_id -> component record). Every call to
-        # _add_score with a check_id lands here, merged per check so the
-        # Score Breakdown panel can show exactly which detection rules
-        # built up a PID's score, in points, with their reasons - "the
-        # analyst never sees an unexplained number".
-        self.score_components = {}
-        # file_hash -> OrderedDict(check_id -> component record), the same
-        # idea for static findings (entropy/RWX/IAT/imphash contributions
-        # per scanned sample).
-        self.static_components = {}
         # pid -> monotonic time of this PID's FIRST score contribution.
         # Together with _last_score_time it bounds how long suspicious
         # activity from this PID has been compounding - an evidence-derived
-        # "activity span" reported in breakdowns and snapshots instead of
-        # a guess from log timestamps.
+        # "activity span" reported in forensic snapshots instead of a guess
+        # from log timestamps.
         self.score_first_seen = {}
         # Optional callable(pid) -> ancestry dict (process_tracker.py's
         # get_ancestry). Set by the entrypoints (main.py / web_server.py)
@@ -389,13 +373,11 @@ class HeuristicEngine:
         return file_hash in self.known_good_hashes
 
     def add_static_score(self, file_hash, score, context, check_id=None):
-        """Record one static finding for a sample hash. `check_id` (new,
-        optional) names WHICH static check contributed, so the static side
-        of the Score Breakdown panel can attribute every point - None (the
-        historical default, still accepted) means the caller predates
-        breakdowns and the context string itself stands in as the label.
-        The allowlist gate below is unchanged and still runs FIRST: a
-        known-good hash never accumulates score or components."""
+        """Record one static finding for a sample hash. `check_id` (optional)
+        names WHICH static check contributed - it rides along on the log
+        line so a finding's origin is always attributable from the record
+        alone. The allowlist gate below still runs FIRST: a known-good hash
+        never accumulates score."""
         if file_hash in self.known_good_hashes:
             # Single choke point every static finding already routes
             # through - hardcoded rules, imphash-family matches, and
@@ -411,8 +393,6 @@ class HeuristicEngine:
         if file_hash not in self.static_scores:
             self.static_scores[file_hash] = 0
         self.static_scores[file_hash] += score
-        self._record_component(self.static_components, file_hash, score, context, check_id,
-                               bound=MAX_COMPONENTS_PER_HASH)
         logging.info(f"[STATIC] {file_hash} -> +{score} ({context}) | Total: {self.static_scores[file_hash]}")
 
     def evaluate_event(self, xml_content):
@@ -530,10 +510,8 @@ class HeuristicEngine:
         deduped-away second dispatch of the same real event."""
         if dedup_key is None:
             # Plain single-sensor dispatch: transparent pass-through. The
-            # check_id still rides along so the Score Breakdown panel can
-            # attribute the points (dropping it here would label every
-            # non-correlated finding 'unattributed' - caught by
-            # test_score_breakdown_attributes_components).
+            # check_id rides along so the log line always names the check
+            # that produced the points.
             self._add_score(pid, score, context, check_id=check_id)
             return True
 
@@ -554,10 +532,10 @@ class HeuristicEngine:
 
     def _add_score(self, pid, score, context, check_id=None):
         """The single choke point every per-PID behavioral finding flows
-        through. `check_id` (optional) names the contributing check so the
-        Score Breakdown panel can attribute every point to its rule - all
-        internal callers now pass one, and None degrades gracefully to a
-        context-string label for any future caller that doesn't."""
+        through. `check_id` (optional) names the contributing check - all
+        internal callers pass one so the log line always shows which rule
+        produced the points, and None degrades gracefully for any future
+        caller that doesn't."""
         if self._is_protected(pid):
             # Never even accumulate score for a protected process - no
             # heuristic gets to push this PID toward mitigate(), full stop.
@@ -578,37 +556,11 @@ class HeuristicEngine:
 
         self.process_scores[pid] += score
         self._last_score_time[pid] = time.monotonic()
-        self._record_component(self.score_components, pid, score, context, check_id,
-                               bound=MAX_COMPONENTS_PER_PID)
         current_score = self.process_scores[pid]
 
         logging.info(f"[TELEMETRY] PID {pid} -> +{score} ({context}) | Total Score: {round(current_score, 1)}")
 
         self._check_threshold(pid)
-
-    def _record_component(self, store, key, score, context, check_id, bound):
-        """Merge one contribution into a per-key (PID or file-hash)
-        component store. Repeats of the same check_id accumulate points and
-        hits and refresh their reason text - so a check that fired five
-        times shows as one row worth 5x its points, which is the honest
-        shape of 'what built this score'. Unbounded growth is impossible by
-        construction: distinct check_ids are bounded by the rule set size,
-        and the LRU bound below is the belt-and-braces backstop (it evicts
-        the LEAST-RECENTLY-CONTRIBUTING check first, keeping the hot ones
-        that actually explain the current score)."""
-        label = check_id or f"unattributed:{context[:48]}"
-        components = store.setdefault(key, OrderedDict())
-        component = components.get(label)
-        if component is None:
-            components[label] = {'points': score, 'hits': 1, 'context': context, 'last_ts': time.time()}
-        else:
-            component['points'] += score
-            component['hits'] += 1
-            component['context'] = context
-            component['last_ts'] = time.time()
-            components.move_to_end(label)
-        while len(components) > bound:
-            components.popitem(last=False)
 
     def _apply_decay(self, pid):
         """Fade this PID's score by elapsed time since its last update, so
@@ -636,12 +588,11 @@ class HeuristicEngine:
         if last_start is not None and last_start != current_start:
             self.process_scores[pid] = 0
             # The old process's forensic state is not this process's: its
-            # score components and activity-span anchor describe a process
-            # that no longer exists. (Forensic SNAPSHOTS are deliberately
-            # NOT cleared here - they are evidence about the past, and
-            # overwriting one only happens if the new process also crosses
-            # a threshold, at which point the newer evidence wins.)
-            self.score_components.pop(pid, None)
+            # activity-span anchor describes a process that no longer
+            # exists. (Forensic SNAPSHOTS are deliberately NOT cleared
+            # here - they are evidence about the past, and overwriting one
+            # only happens if the new process also crosses a threshold, at
+            # which point the newer evidence wins.)
             self.score_first_seen.pop(pid, None)
         self._pid_start_times[pid] = current_start
 
@@ -658,11 +609,10 @@ class HeuristicEngine:
             logging.warning(f"[CRITICAL THREAT] PID {pid} crossed mitigation threshold (Score {score}). Mitigating...")
             self.mitigate(pid)
             self.process_scores[pid] = 0 # reset after mitigation
-            # The just-mitigated process is gone; its live scoring state
-            # (components, activity anchor) describes something that can no
-            # longer accumulate. The forensic snapshot above deliberately
-            # survives this cleanup - that is the evidence copy.
-            self.score_components.pop(pid, None)
+            # The just-mitigated process is gone; its live activity anchor
+            # describes something that can no longer accumulate. The
+            # forensic snapshot above deliberately survives this cleanup -
+            # that is the evidence copy.
             self.score_first_seen.pop(pid, None)
         elif score >= warning:
             # Same snapshot at the warning tier - a warning is the analyst's
@@ -678,9 +628,12 @@ class HeuristicEngine:
         """Capture the Memory Ancestry Graph evidence for `pid` at the
         moment of detection: the full process ancestry (PID, PPID, command
         line, user, spawn time per ancestor - and environment variables for
-        still-alive ancestors when a provider is wired), labeled
-        parent->child edges, and any recent process-ACCESS edge this PID
-        originated (the injection-shaped 'who it touched' connection).
+        still-alive ancestors when a provider is wired), parent->child
+        edges labeled with the syscall family that created each link
+        (EXEC), and any recent process-ACCESS edge this PID originated
+        (the injection-shaped 'who it touched' connection, syscall-labeled
+        MMAP(RWX)/CREATETHREAD from the granted rights - see
+        _record_access_edge).
 
         Deliberate behaviors:
         - ONE snapshot per PID: the first threshold crossing wins. An
@@ -698,7 +651,10 @@ class HeuristicEngine:
         - The trigger_edge (process-access connection) is attached only
           when it actually involves this PID as the actor - the ancestry
           walk describes how the process was BORN, the access edge
-          describes what it TOUCHED; neither claims to be the other.
+          describes what it TOUCHED; neither claims to be the other. When
+          present, the access edge is ALSO merged into the ancestry's edge
+          list (kind='access') so the complete reconstructed attack chain
+          - births AND injections - is one graph, not two artifacts.
         """
         if pid in self.forensic_snapshots:
             return
@@ -719,14 +675,28 @@ class HeuristicEngine:
         else:
             ancestry_note = 'no lineage tracker wired into this entrypoint'
 
+        trigger_edge = self._access_edge_for(pid)
         first_seen = self.score_first_seen.get(pid)
         activity_span = (time.monotonic() - first_seen) if first_seen is not None else None
-        chain_summary = None
         if isinstance(ancestry, dict):
             try:
                 chain_summary = self._chain_summary_from_ancestry(ancestry)
             except Exception:
                 chain_summary = None
+            # Merge the access edge into the ancestry graph when this PID
+            # both has a chain and TOUCHED another process: the graph then
+            # reads as the complete attack chain (birth edges + the
+            # injection edge), which is the whole point of capturing it
+            # automatically at detection time. The edge keeps kind='access'
+            # so consumers can tell it apart from parentage ('EXEC') edges
+            # and render/weight it accordingly - never silently as
+            # parentage.
+            if trigger_edge is not None:
+                merged = dict(trigger_edge)
+                merged['kind'] = 'access'
+                ancestry.setdefault('edges', []).append(merged)
+        else:
+            chain_summary = None
 
         snapshot = {
             'pid': pid,
@@ -738,17 +708,24 @@ class HeuristicEngine:
             'chain_summary': chain_summary,
             'ancestry': ancestry,
             'ancestry_note': ancestry_note,
-            'trigger_edge': self._access_edge_for(pid),
-            'components_at_capture': self._breakdown_components(pid),
+            'trigger_edge': trigger_edge,
         }
         self.forensic_snapshots[pid] = snapshot
         self.forensic_snapshots.move_to_end(pid)
         while len(self.forensic_snapshots) > MAX_FORENSIC_SNAPSHOTS:
             self.forensic_snapshots.popitem(last=False)
 
+        # The forensic log line IS an alert (AlertStore ingests it), so it
+        # must carry the complete reconstruction itself: chain + the
+        # syscall-labeled connection edge, requiring zero analyst effort
+        # and zero extra queries to read the attack chain.
+        edge_note = ''
+        if trigger_edge is not None:
+            target_text = trigger_edge.get('target_image') or f"pid {trigger_edge.get('to')}"
+            edge_note = f" | connection edge: {trigger_edge.get('syscall')} -> {target_text}"
         logging.warning(
             f"[FORENSIC] PID {pid} ancestry captured at {trigger} "
-            f"(chain: {chain_summary or 'unavailable'})"
+            f"(chain: {chain_summary or 'unavailable'}){edge_note}"
         )
 
     @staticmethod
@@ -770,13 +747,35 @@ class HeuristicEngine:
     def _record_access_edge(self, actor_pid, target_pid, target_image, granted_access_raw):
         """Remember one process-access connection (actor -> target with the
         granted rights mask) so a later forensic snapshot for the actor can
-        label the injection-shaped edge. Bounded LRU, same as every other
-        engine store."""
+        label the injection-shaped edge.
+
+        The edge carries TWO labels:
+        - 'label': the raw observation, OpenProcess(<mask>) - what Sysmon
+          literally recorded.
+        - 'syscall': the connection primitive the mask implies, in the
+          ancestry graph's syscall-label vocabulary:
+            MMAP(RWX)    - the mask lets the actor map/write executable
+                           memory into the victim (VM_WRITE or
+                           ALL_ACCESS; the Windows analog of mmap'ing a
+                           RWX page into another process's space).
+            CREATETHREAD - remote-thread injection capability (the
+                           CreateRemoteThread primitive) without an
+                           accompanying write right.
+            OpenProcess(mask) - the mask alone implies nothing injective.
+        Bounded LRU, same as every other engine store."""
+        access_int = _parse_granted_access(granted_access_raw)
+        if access_int == PROCESS_ALL_ACCESS or (access_int & PROCESS_VM_WRITE):
+            syscall_label = 'MMAP(RWX)'
+        elif access_int & PROCESS_CREATE_THREAD:
+            syscall_label = 'CREATETHREAD'
+        else:
+            syscall_label = f'OpenProcess({granted_access_raw})' if granted_access_raw else 'OpenProcess'
         self._recent_access_edges[actor_pid] = {
             'from': actor_pid,
             'to': target_pid,
             'target_image': target_image,
             'label': f'OpenProcess({granted_access_raw})' if granted_access_raw else 'OpenProcess',
+            'syscall': syscall_label,
             'ts': time.time(),
         }
         self._recent_access_edges.move_to_end(actor_pid)
@@ -786,72 +785,6 @@ class HeuristicEngine:
     def _access_edge_for(self, pid):
         """The most recent access edge this PID originated, or None."""
         return self._recent_access_edges.get(pid)
-
-    def _breakdown_components(self, pid):
-        """Component list for one PID (points-ascending stability not
-        guaranteed - sorted descending by points for display), decoupled
-        from the live store so callers can embed it in snapshots without
-        sharing mutable state."""
-        components = self.score_components.get(pid)
-        if not components:
-            return []
-        rows = [dict(check_id=cid, **comp) for cid, comp in components.items()]
-        rows.sort(key=lambda r: r['points'], reverse=True)
-        return rows
-
-    def score_breakdown(self, pid):
-        """Full Score Breakdown payload for one PID: the current (decayed)
-        total, the thresholds it is judged against, the evidence-derived
-        activity span, and every contributing check with its accumulated
-        points, hit count and most recent reason.
-
-        Honesty notes baked into the contract:
-        - 'total' is the LIVE score (post-decay) - the number the verdict
-          and mitigation logic actually act on.
-        - component 'points' are the RAW accumulated contributions, which
-          do not decay (they are history, not state); 'raw_sum' and the
-          per-component share are therefore reported against raw_sum so the
-          panel's bars always sum to 100%, and the live total is shown
-          alongside - the panel never pretends the two are the same number.
-        Returns None for a PID the engine has never scored."""
-        if pid not in self.process_scores and pid not in self.score_components:
-            return None
-        components = self._breakdown_components(pid)
-        raw_sum = sum(c['points'] for c in components)
-        for c in components:
-            c['share'] = round((c['points'] / raw_sum) * 100.0, 1) if raw_sum else 0.0
-        first_seen = self.score_first_seen.get(pid)
-        span = (time.monotonic() - first_seen) if first_seen is not None else None
-        return {
-            'pid': pid,
-            'total': round(self.process_scores.get(pid, 0), 1),
-            'thresholds': dict(self.config['thresholds']),
-            'raw_sum': round(raw_sum, 1),
-            'activity_span_seconds': round(span, 1) if span is not None else None,
-            'activity_span_human': _humanize_span(span) if span is not None else None,
-            'components': components,
-            'forensic_snapshot': self.forensic_snapshots.get(pid),
-        }
-
-    def static_breakdown(self, file_hash):
-        """Score Breakdown payload for one statically-scanned sample - the
-        same contract as score_breakdown minus the behavioral-only fields
-        (no decay, no activity span: static findings are deterministic
-        properties of the file, so their score never fades)."""
-        if file_hash not in self.static_scores and file_hash not in self.static_components:
-            return None
-        components = self.static_components.get(file_hash, OrderedDict())
-        rows = [dict(check_id=cid, **comp) for cid, comp in components.items()]
-        rows.sort(key=lambda r: r['points'], reverse=True)
-        raw_sum = sum(c['points'] for c in rows)
-        for c in rows:
-            c['share'] = round((c['points'] / raw_sum) * 100.0, 1) if raw_sum else 0.0
-        return {
-            'file_hash': file_hash,
-            'total': round(self.static_scores.get(file_hash, 0), 1),
-            'raw_sum': round(raw_sum, 1),
-            'components': rows,
-        }
 
     def _handle_process_create(self, data):
         # Event ID 1: Flag execution from staging directories

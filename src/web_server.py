@@ -42,6 +42,7 @@ from sensor_health import (
 from detection_config import load_config
 from self_test import self_test_loop
 from process_tracker import ProcessTracker
+from hands_on import is_hands_on_message, HANDS_ON_LABEL
 import dashboard_data as dd
 
 HOST = "127.0.0.1"  # loopback only - this server exposes a process-kill endpoint
@@ -61,27 +62,8 @@ PID_TERMINATE_RE = re.compile(r"^/api/processes/(\d+)/terminate$")
 # Detection-forensics API routes. PIDs are parsed as strictly-numeric path
 # segments - a non-numeric PID is a client error (400), not a 500, and the
 # regexes make the routing unambiguous against each other.
-PID_BREAKDOWN_RE = re.compile(r"^/api/processes/(\d+)/breakdown$")
 PID_LIVE_RE = re.compile(r"^/api/processes/(\d+)/live$")
 PID_ANCESTRY_RE = re.compile(r"^/api/processes/(\d+)/ancestry$")
-
-
-def api_process_breakdown(engine, pid_str):
-    """GET /api/processes/<pid>/breakdown - the Score Breakdown Panel feed.
-
-    Module-level so tests (and future entrypoints) can exercise the payload
-    without standing up an HTTP server. Returns (payload, http_status).
-    404 for a PID the engine has never scored - 'no score yet' and 'no such
-    PID' are deliberately the same answer to an analyst: there is nothing
-    to explain yet."""
-    try:
-        pid = int(pid_str)
-    except (TypeError, ValueError):
-        return {"error": "invalid pid"}, 400
-    breakdown = engine.score_breakdown(pid)
-    if breakdown is None:
-        return {"error": "no score recorded for this pid"}, 404
-    return breakdown, 200
 
 
 def api_process_live(pid_str):
@@ -102,7 +84,7 @@ def api_process_live(pid_str):
     the analyst's answer. A dead process is 404 with its capture-time name
     when psutil can still tell us anything, or a bare 404 when it cannot.
 
-    Module-level for the same testability reason as api_process_breakdown;
+    Module-level for the same testability reason as api_process_ancestry;
     psutil is imported at module top so tests monkeypatch the same object
     the handler path uses."""
     try:
@@ -194,7 +176,18 @@ def api_process_ancestry(backend, pid_str):
     blocks for still-alive nodes) plus the engine's forensic snapshot for
     the PID if one was captured at detection time - the snapshot is what
     survives mitigation, so the panel shows it whenever it exists even for
-    a now-dead process. 404 when NEITHER source knows the PID."""
+    a now-dead process. 404 when NEITHER source knows the PID.
+
+    COMPLETE-CHAIN MERGE: the graph presented here is the full attack
+    chain, not two artifacts. Access edges (MMAP(RWX)/CREATETHREAD/
+    OpenProcess - Sysmon Event 10 connections) live in the engine's own
+    bounded store and can be observed AFTER the threshold snapshot was
+    frozen (snapshots are first-wins evidence and are never rewritten), so
+    this endpoint merges the engine's current access edge into the
+    presented ancestry as a kind='access' edge. The merge only ever ADDS
+    the observed connection - birth edges stay EXEC-labeled from the
+    tracker, the stored snapshot stays untouched, and if no access edge
+    was ever observed the graph is exactly what the trackers recorded."""
     try:
         pid = int(pid_str)
     except (TypeError, ValueError):
@@ -204,6 +197,19 @@ def api_process_ancestry(backend, pid_str):
     snapshot = backend.engine.forensic_snapshots.get(pid)
     if ancestry is None and snapshot is None:
         return {"error": "no ancestry or forensic snapshot recorded for this pid", "pid": pid}, 404
+
+    if isinstance(ancestry, dict):
+        # Prefer the engine's live edge store (the most recent
+        # observation); fall back to the snapshot's frozen trigger_edge
+        # for the case where the bounded LRU already evicted it but the
+        # snapshot preserved a copy. Never duplicates: a graph that
+        # already carries a kind='access' edge is complete.
+        edge = backend.engine._access_edge_for(pid) or (snapshot or {}).get('trigger_edge')
+        if edge is not None and not any(e.get('kind') == 'access' for e in ancestry.get('edges', [])):
+            merged = dict(edge)
+            merged['kind'] = 'access'
+            ancestry.setdefault('edges', []).append(merged)
+
     return {
         "pid": pid,
         "ancestry": ancestry,
@@ -214,7 +220,17 @@ def api_process_ancestry(backend, pid_str):
 class AlertStore:
     """Thread-safe, bounded buffer of structured alerts, fed by a logging
     handler attached to the root logger - every finding the engine/scanner/
-    monitor/inspector already log becomes a dashboard alert for free."""
+    monitor/inspector already log becomes a dashboard alert for free.
+
+    HANDS-ON THREAT classification: any log message carrying the
+    hands_on.HANDS_ON_TAG marker (see hands_on.py - emitted by the static
+    scanner when a finding positively identifies a Cobalt Strike stager)
+    is stored with hands_on=True + classification='HANDS-ON THREAT', and
+    snapshot() pins those alerts to the TOP of the queue regardless of
+    timestamp. The rationale: the most dangerous class of detection must
+    be impossible to miss - a hands-on alert that arrived an hour ago and
+    has since been buried under thirty benign INFO lines is exactly the
+    alert that gets missed during an active intrusion."""
 
     def __init__(self, maxlen=MAX_ALERTS):
         self._lock = threading.Lock()
@@ -223,21 +239,41 @@ class AlertStore:
 
     def add(self, record: logging.LogRecord):
         with self._lock:
+            message = record.getMessage()
             entry = {
                 "id": self._next_id,
                 "ts": record.created,
                 "time": time.strftime("%H:%M:%S", time.localtime(record.created)),
                 "severity": dd.severity_of(record),
-                "category": dd.categorize(record.getMessage()),
-                "message": record.getMessage(),
+                "category": dd.categorize(message),
+                "message": message,
             }
+            if is_hands_on_message(message):
+                # Distinct visual classification, separate from generic
+                # findings: the frontend renders the orange banner off
+                # these two fields, and snapshot() pins the row to the
+                # top of the queue. Kept as explicit fields (not guessed
+                # from the message text at render time) so the contract
+                # lives in one place - hands_on.py - not in JavaScript.
+                entry["hands_on"] = True
+                entry["classification"] = HANDS_ON_LABEL
             self._next_id += 1
             self._alerts.appendleft(entry)
 
     def snapshot(self, limit=None):
+        """Alerts newest-first, EXCEPT that HANDS-ON THREAT alerts are
+        pinned to the very top regardless of timestamp. The partition is
+        stable (both halves keep their newest-first order), so pinning
+        reorders classes, never timestamps. `limit` is applied AFTER
+        pinning: a hands-on alert is never truncated away by the page
+        size - it would defeat the whole point if the one alert that must
+        be seen was the one dropped."""
         with self._lock:
             items = list(self._alerts)
-        return items[:limit] if limit else items
+        pinned = [a for a in items if a.get("hands_on")]
+        rest = [a for a in items if not a.get("hands_on")]
+        ordered = pinned + rest
+        return ordered[:limit] if limit else ordered
 
 
 class AlertLogHandler(logging.Handler):
@@ -529,11 +565,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
             # Detection-forensics routes (see the *_RE regexes above). The
             # helpers return (payload, status) so error shapes are tested
             # without an HTTP server.
-            breakdown = PID_BREAKDOWN_RE.match(path)
-            if breakdown:
-                payload, status = api_process_breakdown(backend.engine, breakdown.group(1))
-                self._send_json(payload, status)
-                return
             live = PID_LIVE_RE.match(path)
             if live:
                 payload, status = api_process_live(live.group(1))

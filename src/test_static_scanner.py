@@ -123,6 +123,95 @@ def test_imphash_match_against_known_family():
     assert engine.static_scores["6" * 64] == 70
 
 
+def test_cobalt_strike_imphash_emits_hands_on_classification():
+    # A Cobalt Strike family match is a HANDS-ON THREAT: scored identically
+    # to any family match, but under its own check_id and accompanied by
+    # the tagged WARNING the dashboard pins to the top of the alert queue.
+    entry = _entry("6a" * 32, imphash="csstagerimphash01", file_name="stager.exe")
+    with _CaptureLogs() as records:
+        engine = _scan([entry], known_imphashes={"csstagerimphash01": {"family": "CobaltStrike", "sample_count": 340, "source": "malwarebazaar"}})
+    assert engine.static_scores["6a" * 32] == 70
+    tagged = [r for r in records if '[HANDS-ON THREAT]' in r.getMessage()]
+    assert len(tagged) == 1
+    assert 'Cobalt Strike stager' in tagged[0].getMessage()
+    assert 'stager.exe' in tagged[0].getMessage()
+
+
+def test_cobalt_strike_family_spelling_variants_all_classify():
+    # MalwareBazaar reporters spell the family inconsistently; every
+    # variant must land in the hands-on path (check_id distinguishes it
+    # from the generic imphash_family finding).
+    for family in ('CobaltStrike', 'Cobalt Strike', 'Cobalt_Strike', 'Cobalt'):
+        entry = _entry("6b" * 32, imphash=f"imphash-{family.replace(' ', '')}")
+        engine = _scan([entry], known_imphashes={entry['imphash']: {"family": family, "sample_count": 3, "source": "malwarebazaar"}})
+        scored = engine.static_scores["6b" * 32]
+        assert scored == 70, f"family '{family}' must still score identically"
+
+
+def test_non_cobalt_family_never_earns_hands_on_tag():
+    # Generic family hits (AsyncRAT etc) are exactly the 'generic shellcode/
+    # family' class the HANDS-ON banner must stay separate from - no tag,
+    # no dedicated check id, just the ordinary imphash_family finding.
+    entry = _entry("6c" * 32, imphash="asyncratimphash", file_name="rat.exe")
+    with _CaptureLogs() as records:
+        engine = _scan([entry], known_imphashes={"asyncratimphash": {"family": "AsyncRAT", "sample_count": 9, "source": "malwarebazaar"}})
+    assert engine.static_scores["6c" * 32] == 70
+    assert not [r for r in records if '[HANDS-ON THREAT]' in r.getMessage()]
+
+
+def test_near_miss_family_is_rejected():
+    # A family whose normalized name merely CONTAINS 'cobalt' as raw text
+    # but is not Cobalt Strike must not match the fragment matcher (the
+    # banner must mean Cobalt Strike, not 'something cobalt-ish').
+    entry = _entry("6d" * 32, imphash="cobaltratimphash")
+    with _CaptureLogs() as records:
+        engine = _scan([entry], known_imphashes={"cobaltratimphash": {"family": "Cobaltrat", "sample_count": 1, "source": "malwarebazaar"}})
+    assert engine.static_scores["6d" * 32] == 70
+    assert not [r for r in records if '[HANDS-ON THREAT]' in r.getMessage()]
+
+
+def test_cobalt_strike_custom_rule_emits_hands_on_classification():
+    # A custom YAML rule self-declaring Cobalt Strike earns the tag by
+    # operator declaration - same tagged-line mechanism, pinned identically.
+    from rule_engine import Rule
+    cs_rule = Rule({'id': 'cobalt_strike_stager_load', 'applies_to': 'static_pe', 'score': 70,
+                    'match': {'all': [{'field': 'imports_flat', 'op': 'contains', 'value': 'virtualalloc'}]}},
+                   source_file='<test>')
+    entry = _entry("6e" * 32, imports={"kernel32.dll": ["VirtualAlloc"]})
+    with _CaptureLogs() as records:
+        engine = _scan([entry], rule_engine=_StaticOnlyRuleEngine([cs_rule]))
+    tagged = [r for r in records if '[HANDS-ON THREAT]' in r.getMessage()]
+    assert len(tagged) == 1
+    assert 'cobalt_strike_stager_load' in tagged[0].getMessage()
+
+
+def test_non_cobalt_custom_rule_never_earns_hands_on_tag():
+    from rule_engine import Rule
+    plain_rule = Rule({'id': 'generic_loader_load', 'applies_to': 'static_pe', 'score': 40,
+                       'match': {'all': [{'field': 'imports_flat', 'op': 'contains', 'value': 'virtualalloc'}]}},
+                      source_file='<test>')
+    entry = _entry("6f" * 32, imports={"kernel32.dll": ["VirtualAlloc"]})
+    with _CaptureLogs() as records:
+        _scan([entry], rule_engine=_StaticOnlyRuleEngine([plain_rule]))
+    assert not [r for r in records if '[HANDS-ON THREAT]' in r.getMessage()]
+
+
+class _StaticOnlyRuleEngine:
+    """Minimal rule-engine stand-in: only the static_pe path is exercised
+    by StaticScanner, so evaluate_static is all this fake implements."""
+
+    def __init__(self, rules):
+        self._rules = rules
+
+    def evaluate_static(self, feature_dict):
+        hits = []
+        for rule in self._rules:
+            for cond in rule.match.get('all', []):
+                if cond['field'] == 'imports_flat' and cond['value'] in feature_dict.get('imports_flat', []):
+                    hits.append((rule, f"{cond['value']} present"))
+        return hits
+
+
 def test_imphash_with_no_match_scores_nothing():
     entry = _entry("7" * 64, imphash="0000000000000000")
     engine = _scan([entry], known_imphashes={"deadbeefcafebabe": {"family": "AsyncRAT"}})

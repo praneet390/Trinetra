@@ -1,6 +1,7 @@
 """Self-check for web_server.py's self-elevation logic - monkeypatches
 ShellExecuteW so this never pops a real UAC prompt. Run: python test_web_server.py"""
 
+import logging
 import os
 import subprocess
 import sys
@@ -385,38 +386,68 @@ def test_dashboard_server_refuses_to_share_a_port():
     assert ws.DashboardServer.allow_reuse_address is False
 
 
+def test_alertstore_flags_hands_on_threat_alerts():
+    # The HANDS-ON THREAT contract end-to-end at the store level: a log
+    # record carrying the hands_on tag (what static_scanner emits when a
+    # finding positively identifies a Cobalt Strike stager) must come back
+    # with the classification fields set, and an ordinary finding must not.
+    store = ws.AlertStore()
+    store.add(logging.LogRecord('t', logging.WARNING, __file__, 1,
+                                "[HANDS-ON THREAT] evil.exe: Cobalt Strike stager - imphash matches known family 'CobaltStrike'",
+                                None, None))
+    store.add(logging.LogRecord('t', logging.WARNING, __file__, 1,
+                                "Untrusted access to svchost.exe (Access: 0x143a) - Potential Process Hollowing",
+                                None, None))
+    rows = store.snapshot()
+    assert rows[0]['hands_on'] is True
+    assert rows[0]['classification'] == 'HANDS-ON THREAT'
+    assert 'Cobalt Strike stager' in rows[0]['message']
+    # ordinary findings carry no classification
+    assert 'hands_on' not in rows[1]
+    assert 'classification' not in rows[1]
+
+
+def test_alertstore_pins_hands_on_alerts_regardless_of_timestamp():
+    # Pinning contract: the hands-on alert arrived FIRST (oldest), got
+    # buried under newer ordinary alerts, and must still come back on top
+    # - the most dangerous class of detection is impossible to miss no
+    # matter how much noise arrived after it.
+    store = ws.AlertStore()
+    store.add(logging.LogRecord('t', logging.WARNING, __file__, 1,
+                                "[HANDS-ON THREAT] stager.exe: Cobalt Strike stager identified", None, None))
+    for i in range(5):
+        store.add(logging.LogRecord('t', logging.INFO, __file__, 1,
+                                    f"benign operational line {i}", None, None))
+    rows = store.snapshot()
+    assert rows[0]['hands_on'] is True
+    assert all(not a.get('hands_on') for a in rows[1:])
+    # within each class the newest-first order is preserved (pinning
+    # reorders classes, never timestamps)
+    ordinary = [a['message'] for a in rows[1:]]
+    assert ordinary == sorted(ordinary, key=lambda m: int(m.split()[-1]), reverse=True)
+
+
+def test_alertstore_pinning_survives_limit():
+    # limit is applied AFTER pinning: a page size smaller than the buffer
+    # must never truncate away a hands-on alert - that would defeat the
+    # whole point of pinning.
+    store = ws.AlertStore()
+    store.add(logging.LogRecord('t', logging.WARNING, __file__, 1,
+                                "[HANDS-ON THREAT] stager.exe: Cobalt Strike stager identified", None, None))
+    for i in range(20):
+        store.add(logging.LogRecord('t', logging.INFO, __file__, 1,
+                                    f"filler {i}", None, None))
+    rows = store.snapshot(limit=10)
+    assert len(rows) == 10
+    assert rows[0]['hands_on'] is True
+
+
 def test_backend_wires_ancestry_provider_for_forensic_snapshots():
     backend = ws.Backend()
     # The engine's detection-time ancestry capture must walk THIS backend's
     # lineage tracker - the same graph the Process Explorer Lineage column
     # renders - so snapshots and the UI can never disagree.
     assert backend.engine.ancestry_provider == backend.process_tracker.get_ancestry
-
-
-def test_breakdown_endpoint_returns_attributed_components():
-    backend = ws.Backend()
-    pid = 777001  # arbitrary fake PID; Backend's engine is not wired to live sensors
-    backend.engine._add_score(pid, 30, 'staging dir exec', check_id='staging_dir')
-    payload, status = ws.api_process_breakdown(backend.engine, str(pid))
-    assert status == 200
-    assert payload['pid'] == pid
-    assert payload['components'][0]['check_id'] == 'staging_dir'
-    assert payload['components'][0]['points'] == 30
-    assert payload['thresholds']['warning'] == backend.config['thresholds']['warning']
-    assert 'forensic_snapshot' in payload
-
-
-def test_breakdown_endpoint_404_for_unscored_pid():
-    backend = ws.Backend()
-    payload, status = ws.api_process_breakdown(backend.engine, '777002')
-    assert status == 404
-    assert 'error' in payload
-
-
-def test_breakdown_endpoint_400_for_garbage_pid():
-    backend = ws.Backend()
-    payload, status = ws.api_process_breakdown(backend.engine, 'not-a-pid')
-    assert status == 400
 
 
 def test_live_endpoint_reports_a_live_process(monkeypatch):
@@ -531,6 +562,37 @@ def test_ancestry_endpoint_merges_tracker_and_snapshot():
     assert payload['forensic_snapshot']['chain_summary'] == 'explorer.exe -> evil.exe'
 
 
+def test_ancestry_endpoint_merges_access_edge_observed_after_the_snapshot():
+    # COMPLETE-CHAIN contract: the LSASS/injection connection can be
+    # observed AFTER the warning-tier snapshot froze (first-wins evidence,
+    # never rewritten). The endpoint must still present ONE complete graph
+    # - EXEC birth edges from the tracker plus the MMAP(RWX) access edge
+    # from the engine's store - without mutating the stored snapshot.
+    backend = ws.Backend()
+    pid = 777020
+    backend.process_tracker.add(1, {'ProcessId': '1', 'ParentProcessId': None, 'Image': 'explorer.exe'})
+    backend.process_tracker.add(1, {'ProcessId': str(pid), 'ParentProcessId': '1',
+                                    'Image': 'implant.exe', 'CommandLine': 'implant.exe'})
+    backend.engine._add_score(pid, 60, 'staging dir exec', check_id='staging_dir')  # warning -> snapshot frozen
+    assert backend.engine.forensic_snapshots[pid]['trigger_edge'] is None
+    backend.engine._handle_process_access({                       # connection seen LATER
+        'SourceProcessId': pid, 'SourceImage': r'C:\Temp\implant.exe',
+        'TargetProcessId': 700, 'TargetImage': 'c:\\windows\\system32\\lsass.exe',
+        'GrantedAccess': '0x1438',
+    })
+    payload, status = ws.api_process_ancestry(backend, str(pid))
+    assert status == 200
+    edges = payload['ancestry']['edges']
+    exec_edges = [e for e in edges if e['label'] == 'EXEC']
+    access_edges = [e for e in edges if e.get('kind') == 'access']
+    assert len(exec_edges) == 1
+    assert len(access_edges) == 1
+    assert access_edges[0]['syscall'] == 'MMAP(RWX)'
+    # the frozen evidence itself must remain untouched
+    assert backend.engine.forensic_snapshots[pid]['ancestry']['edges'] == [
+        {'from': 1, 'to': pid, 'label': 'EXEC'}]
+
+
 def test_ancestry_endpoint_snapshot_only_for_evicted_tracker_entries():
     # A PID whose tracker entries were evicted but whose forensic snapshot
     # survives must still return 200 - the snapshot IS the evidence copy.
@@ -541,7 +603,6 @@ def test_ancestry_endpoint_snapshot_only_for_evicted_tracker_entries():
         'score_at_capture': 90, 'activity_span_seconds': None,
         'activity_span_human': None, 'chain_summary': None,
         'ancestry': None, 'ancestry_note': 'test', 'trigger_edge': None,
-        'components_at_capture': [],
     }
     payload, status = ws.api_process_ancestry(backend, str(pid))
     assert status == 200

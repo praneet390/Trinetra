@@ -234,6 +234,9 @@ function renderProcessChart(rows) {
 }
 
 // ---- detections table -------------------------------------------------
+// HANDS-ON THREAT alerts arrive pre-pinned (AlertStore.snapshot pins them
+// server-side, regardless of timestamp), so this renderer only has to draw
+// the orange banner the classification promises.
 function renderAlerts() {
   const body = document.getElementById("alertsBody");
   const textFilter = document.getElementById("alertFilter").value.toLowerCase();
@@ -252,10 +255,20 @@ function renderAlerts() {
   }
   for (const a of rows.slice(0, 200)) {
     const tr = el("tr");
+    if (a.hands_on) tr.className = "hands-on-row";
     tr.appendChild(el("td", { text: a.time }));
     tr.appendChild(el("td", { text: a.severity, className: `sev-${a.severity}` }));
     tr.appendChild(el("td", { text: a.category }));
-    tr.appendChild(el("td", { text: a.message }));
+    const msgTd = el("td");
+    if (a.hands_on) {
+      // The orange HANDS-ON THREAT banner: a chip ahead of the message so
+      // the most dangerous class of detection is impossible to miss,
+      // even scrolled into a wall of other rows.
+      msgTd.appendChild(el("span", { text: a.classification || "HANDS-ON THREAT", className: "hands-on-chip" }));
+      msgTd.appendChild(document.createTextNode(" "));
+    }
+    msgTd.appendChild(document.createTextNode(a.message));
+    tr.appendChild(msgTd);
     body.appendChild(tr);
   }
 }
@@ -275,14 +288,11 @@ function renderProcesses(rows) {
     tr.appendChild(el("td", { text: r.score }));
     tr.appendChild(el("td", { text: r.verdict, className: `sev-${r.verdict === "CRITICAL" ? "CRITICAL" : r.verdict === "SUSPICIOUS" ? "WARNING" : "INFO"}` }));
     const actionTd = el("td");
-    // Detection-forensics actions: why is this score what it is (Breakdown),
-    // is the process still alive right now (Live), and how did it get here
-    // (Chain). All three fetch on click - they are point-in-time answers,
-    // not polled state, which matches how an analyst actually consumes
-    // them (ask once per alert, re-ask when in doubt).
-    const breakdownBtn = el("button", { text: "Breakdown", className: "btn btn-small" });
-    breakdownBtn.addEventListener("click", () => openBreakdown(r.pid));
-    actionTd.appendChild(breakdownBtn);
+    // Detection-forensics actions: is the process still alive right now
+    // (Live), and how did it get here (Chain). Both fetch on click - they
+    // are point-in-time answers, not polled state, which matches how an
+    // analyst actually consumes them (ask once per alert, re-ask when in
+    // doubt).
     const liveBtn = el("button", { text: "Live", className: "btn btn-small" });
     liveBtn.addEventListener("click", () => openLive(r.pid));
     actionTd.appendChild(liveBtn);
@@ -435,11 +445,11 @@ document.addEventListener("DOMContentLoaded", () => {
 });
 
 // ---- detection-forensics modal panels -------------------------------------
-// One modal shell (see index.html) serves three panels: Score Breakdown,
-// Live Process Status, and the Memory Ancestry chain. Every dynamic value
-// is rendered via textContent - never innerHTML - because these payloads
-// embed process names, command lines and rule contexts that can be
-// attacker-controlled. Same XSS discipline as the tables above.
+// One modal shell (see index.html) serves two panels: Live Process Status,
+// and the Memory Ancestry chain. Every dynamic value is rendered via
+// textContent - never innerHTML - because these payloads embed process
+// names, command lines and rule contexts that can be attacker-controlled.
+// Same XSS discipline as the tables above.
 
 function openModal(title) {
   document.getElementById("modalTitle").textContent = title;
@@ -476,52 +486,6 @@ async function fetchModalJSON(url, body, missingText) {
     clear(body);
     body.appendChild(modalNote(missingText));
     return null;
-  }
-}
-
-async function openBreakdown(pid) {
-  const body = openModal(`Score Breakdown — PID ${pid}`);
-  body.appendChild(modalNote("Loading breakdown..."));
-  const data = await fetchModalJSON(
-    `/api/processes/${pid}/breakdown`, body,
-    `No breakdown available for PID ${pid} (the engine has not scored it, or it was never observed).`
-  );
-  if (!data) return;
-  clear(body);
-
-  const head = el("div", { className: "breakdown-head" });
-  head.appendChild(kvRow("Live score (after decay)", data.total));
-  head.appendChild(kvRow("Raw contributions (never decay)", data.raw_sum));
-  head.appendChild(kvRow("Thresholds", `warning ${data.thresholds?.warning ?? "?"} / critical ${data.thresholds?.critical ?? "?"}`));
-  head.appendChild(kvRow("Suspicious activity span", data.activity_span_human));
-  body.appendChild(head);
-
-  // The two numbers measure different things and the panel says so:
-  // 'total' is what the engine acts on (it decays), while the component
-  // points below are history (they never decay). Showing both, labeled,
-  // is the whole point - no unexplained numbers anywhere.
-  body.appendChild(modalNote("Component points are raw contributions (history); the live score decays ~20 pts/min. Shares are of raw contributions."));
-
-  if (!data.components || data.components.length === 0) {
-    body.appendChild(modalNote("Score exists but no attributed components remain (decayed or rescored)."));
-    return;
-  }
-  for (const c of data.components) {
-    const row = el("div", { className: "comp-row" });
-    const label = el("div", { className: "comp-label" });
-    label.appendChild(el("span", { text: c.check_id, className: "comp-id" }));
-    label.appendChild(el("span", {
-      text: `+${c.points} pts × ${c.hits} hit${c.hits === 1 ? "" : "s"} · ${c.share}%`,
-      className: "comp-points",
-    }));
-    row.appendChild(label);
-    const barOuter = el("div", { className: "comp-bar" });
-    const barInner = el("div", { className: "comp-bar-fill" });
-    barInner.style.width = `${Math.max(2, Math.min(100, c.share))}%`;
-    barOuter.appendChild(barInner);
-    row.appendChild(barOuter);
-    row.appendChild(el("div", { text: c.context, className: "comp-context" }));
-    body.appendChild(row);
   }
 }
 
@@ -600,7 +564,11 @@ async function openChain(pid) {
     snapBox.appendChild(kvRow("Score at capture", snap.score_at_capture));
     snapBox.appendChild(kvRow("Activity span", snap.activity_span_human));
     if (snap.trigger_edge) {
-      snapBox.appendChild(kvRow("Connection edge", `${snap.trigger_edge.label} → ${snap.trigger_edge.target_image || `pid ${snap.trigger_edge.to}`}`));
+      // Edge label in syscall vocabulary: EXEC for a parentage link,
+      // MMAP(RWX)/CREATETHREAD for an injection-shaped connection (see
+      // heuristic_engine._record_access_edge).
+      const syscall = snap.trigger_edge.syscall || snap.trigger_edge.label;
+      snapBox.appendChild(kvRow("Connection edge", `${syscall} → ${snap.trigger_edge.target_image || `pid ${snap.trigger_edge.to}`}`));
     }
     if (snap.chain_summary) snapBox.appendChild(kvRow("Chain summary", snap.chain_summary));
     if (snap.ancestry_note) snapBox.appendChild(modalNote(`Ancestry: ${snap.ancestry_note}`));
@@ -623,8 +591,8 @@ async function openChain(pid) {
 
   // Render the chain oldest-first: each node indented under its parent,
   // with the connecting edge label on the connector line (EXEC for a
-  // process-create link; the forensic snapshot's access edge, if any, is
-  // shown in the snapshot box above since it is not a parentage relation).
+  // process-create link; access-kind edges - MMAP(RWX) etc - are shown in
+  // the snapshot box above since they are not parentage relations).
   const tree = el("div", { className: "chain-tree" });
   ancestry.nodes.forEach((node, i) => {
     const nodeBox = el("div", { className: "chain-node" });

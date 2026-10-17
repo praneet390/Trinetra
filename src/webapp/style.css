@@ -258,7 +258,7 @@ tbody tr:hover { background: var(--panel-2); }
   line-height: 1.6;
 }
 
-/* ---- detection-forensics modal (Breakdown / Live / Chain) ----------------
+/* ---- detection-forensics modal (Live / Chain) ----------------------------
    One shared modal shell; opened by the per-row buttons in the Endpoint
    Processes table. Backdrop dims the page; the panel itself is a floating
    card on the same dark palette as the rest of the dashboard. */
@@ -297,9 +297,8 @@ tbody tr:hover { background: var(--panel-2); }
 .kv-label { color: var(--muted); min-width: 180px; flex-shrink: 0; }
 .kv-value { color: var(--fg); font-family: var(--mono); word-break: break-all; }
 
-/* Score Breakdown: one bar per contributing check, width = share of the
-   raw contribution sum; the reason text sits under its bar. */
-.breakdown-head, .live-head, .snap-box {
+/* Live Process Status + Memory Ancestry snapshot box (shared card shape). */
+.live-head, .snap-box {
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 8px 12px;
@@ -307,13 +306,26 @@ tbody tr:hover { background: var(--panel-2); }
   background: var(--panel-2);
 }
 .live-head { display: flex; flex-wrap: wrap; gap: 4px 22px; align-items: center; }
-.comp-row { margin: 10px 0 14px; }
-.comp-label { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
-.comp-id { color: var(--accent); font-family: var(--mono); font-weight: 600; }
-.comp-points { color: var(--muted); font-family: var(--mono); white-space: nowrap; }
-.comp-bar { height: 6px; border-radius: 3px; background: var(--panel-2); margin-top: 5px; overflow: hidden; }
-.comp-bar-fill { height: 100%; background: var(--accent); border-radius: 3px; }
-.comp-context { color: var(--muted); font-size: 11px; margin-top: 5px; line-height: 1.45; word-break: break-word; }
+
+/* HANDS-ON THREAT: the orange banner classification for Cobalt Strike
+   stager detections (see hands_on.py / web_server.AlertStore). Pinned to
+   the top of the Detections queue server-side; these styles make the row
+   impossible to mistake for a generic finding - orange left rail + tinted
+   background on the row, and a filled orange chip ahead of the message. */
+tr.hands-on-row td { background: rgba(184, 92, 11, 0.18); }
+tr.hands-on-row td:first-child { box-shadow: inset 3px 0 0 #c26a10; }
+.hands-on-chip {
+  display: inline-block;
+  background: #c26a10;
+  color: #fff4e8;
+  font-weight: 700;
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  padding: 2px 8px;
+  border-radius: 4px;
+  margin-right: 6px;
+  vertical-align: 1px;
+}
 
 /* Live Process Status lists (open files, connections, env excerpts). */
 .live-list { margin: 4px 0 8px; padding-left: 20px; color: var(--fg); font-size: 12px; line-height: 1.6; }

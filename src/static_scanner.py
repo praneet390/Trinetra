@@ -3,6 +3,8 @@ import json
 import hashlib
 import logging
 
+import hands_on
+
 
 # Well-known publishers frequently spoofed via PE version-info resources.
 # If a binary claims one of these but ships no Authenticode signature blob
@@ -157,15 +159,38 @@ class StaticScanner:
             # sharing an imphash almost always share compiler-emitted
             # binary lineage even after the bytes are repacked, so this
             # catches variants this project has never seen a sample of.
+            #
+            # Cobalt Strike is split out as its own classification: a
+            # positively-identified Cobalt Strike stager is a HANDS-ON
+            # THREAT (an operator's tooling on this host), not a generic
+            # family hit, and the tagged log line below is what the
+            # dashboard pins to the top of the alert queue with an orange
+            # banner (see hands_on.py + web_server.AlertStore). Scoring is
+            # identical either way - the classification changes how the
+            # finding is SURFACED, never how it is weighed.
             imphash = entry.get('imphash')
             if imphash and imphash in self.known_imphashes:
                 known = self.known_imphashes[imphash]
-                self.engine.add_static_score(
-                    file_hash, 70,
-                    f"{filename}: Imphash matches known family '{known.get('family', '?')}' "
-                    f"(source: {known.get('source', '?')}, {known.get('sample_count', '?')} samples seen)",
-                    check_id='imphash_family'
-                )
+                family = known.get('family', '?')
+                intel_note = (f"source: {known.get('source', '?')}, "
+                              f"{known.get('sample_count', '?')} samples seen")
+                if hands_on.is_cobalt_strike_family(family):
+                    logging.warning(
+                        f"{hands_on.HANDS_ON_TAG} {filename}: Cobalt Strike stager identified "
+                        f"- imphash '{imphash}' matches known family '{family}' ({intel_note})"
+                    )
+                    self.engine.add_static_score(
+                        file_hash, 70,
+                        f"{filename}: Cobalt Strike stager - imphash matches known family "
+                        f"'{family}' ({intel_note})",
+                        check_id='cobalt_strike_stager'
+                    )
+                else:
+                    self.engine.add_static_score(
+                        file_hash, 70,
+                        f"{filename}: Imphash matches known family '{family}' ({intel_note})",
+                        check_id='imphash_family'
+                    )
 
             structural_features.append(str(sorted(import_flat)))
 
@@ -200,6 +225,17 @@ class StaticScanner:
                 }
                 for rule, message in self.rule_engine.evaluate_static(feature_dict):
                     self.engine.add_static_score(file_hash, rule.score, f"{filename}: [RULE:{rule.id}] {message}", check_id=f'rule:{rule.id}')
+                    # A custom rule that self-declares Cobalt Strike earns
+                    # the HANDS-ON THREAT classification by operator
+                    # declaration - the rule author already made the
+                    # family-attribution call this tag requires. Same
+                    # tagged-line mechanism as the imphash path above, so
+                    # the dashboard pins and banners it identically.
+                    if hands_on.is_cobalt_strike_rule(rule.id, message):
+                        logging.warning(
+                            f"{hands_on.HANDS_ON_TAG} {filename}: Cobalt Strike stager identified "
+                            f"by custom rule '{rule.id}' - {message}"
+                        )
 
             # Calculate Structural Hash
             struct_str = "|".join(structural_features)
