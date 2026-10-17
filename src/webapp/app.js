@@ -275,6 +275,20 @@ function renderProcesses(rows) {
     tr.appendChild(el("td", { text: r.score }));
     tr.appendChild(el("td", { text: r.verdict, className: `sev-${r.verdict === "CRITICAL" ? "CRITICAL" : r.verdict === "SUSPICIOUS" ? "WARNING" : "INFO"}` }));
     const actionTd = el("td");
+    // Detection-forensics actions: why is this score what it is (Breakdown),
+    // is the process still alive right now (Live), and how did it get here
+    // (Chain). All three fetch on click - they are point-in-time answers,
+    // not polled state, which matches how an analyst actually consumes
+    // them (ask once per alert, re-ask when in doubt).
+    const breakdownBtn = el("button", { text: "Breakdown", className: "btn btn-small" });
+    breakdownBtn.addEventListener("click", () => openBreakdown(r.pid));
+    actionTd.appendChild(breakdownBtn);
+    const liveBtn = el("button", { text: "Live", className: "btn btn-small" });
+    liveBtn.addEventListener("click", () => openLive(r.pid));
+    actionTd.appendChild(liveBtn);
+    const chainBtn = el("button", { text: "Chain", className: "btn btn-small" });
+    chainBtn.addEventListener("click", () => openChain(r.pid));
+    actionTd.appendChild(chainBtn);
     const btn = el("button", { text: "Terminate", className: "btn btn-danger-outline btn-small" });
     btn.addEventListener("click", () => terminateProcess(r.pid, r.name));
     actionTd.appendChild(btn);
@@ -409,6 +423,239 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("severityFilter").addEventListener("change", renderAlerts);
   document.getElementById("explorerFilter").addEventListener("input", renderExplorer);
   document.getElementById("isolateBtn").addEventListener("click", isolateHost);
+  // Detection-forensics modal wiring: backdrop click and the ✕ button both
+  // close. The script tag sits at the end of <body> (see index.html), so
+  // these elements already exist when this runs.
+  document.getElementById("modalClose").addEventListener("click", closeModal);
+  document.getElementById("modalBackdrop").addEventListener("click", (e) => {
+    if (e.target === e.currentTarget) closeModal(); // only clicks on the dark backdrop itself
+  });
   poll();
   setInterval(poll, POLL_MS);
 });
+
+// ---- detection-forensics modal panels -------------------------------------
+// One modal shell (see index.html) serves three panels: Score Breakdown,
+// Live Process Status, and the Memory Ancestry chain. Every dynamic value
+// is rendered via textContent - never innerHTML - because these payloads
+// embed process names, command lines and rule contexts that can be
+// attacker-controlled. Same XSS discipline as the tables above.
+
+function openModal(title) {
+  document.getElementById("modalTitle").textContent = title;
+  const body = document.getElementById("modalBody");
+  clear(body);
+  document.getElementById("modalBackdrop").style.display = "flex";
+  return body;
+}
+
+function closeModal() {
+  document.getElementById("modalBackdrop").style.display = "none";
+}
+
+function modalNote(text) {
+  return el("p", { text, className: "modal-note" });
+}
+
+function kvRow(label, value) {
+  const div = el("div", { className: "kv-row" });
+  div.appendChild(el("span", { text: label, className: "kv-label" }));
+  const display = value === null || value === undefined || value === "" ? "—" : String(value);
+  div.appendChild(el("span", { text: display, className: "kv-value" }));
+  return div;
+}
+
+function modalHeading(text) {
+  return el("h4", { text, className: "modal-h4" });
+}
+
+async function fetchModalJSON(url, body, missingText) {
+  try {
+    return await getJSON(url);
+  } catch (e) {
+    clear(body);
+    body.appendChild(modalNote(missingText));
+    return null;
+  }
+}
+
+async function openBreakdown(pid) {
+  const body = openModal(`Score Breakdown — PID ${pid}`);
+  body.appendChild(modalNote("Loading breakdown..."));
+  const data = await fetchModalJSON(
+    `/api/processes/${pid}/breakdown`, body,
+    `No breakdown available for PID ${pid} (the engine has not scored it, or it was never observed).`
+  );
+  if (!data) return;
+  clear(body);
+
+  const head = el("div", { className: "breakdown-head" });
+  head.appendChild(kvRow("Live score (after decay)", data.total));
+  head.appendChild(kvRow("Raw contributions (never decay)", data.raw_sum));
+  head.appendChild(kvRow("Thresholds", `warning ${data.thresholds?.warning ?? "?"} / critical ${data.thresholds?.critical ?? "?"}`));
+  head.appendChild(kvRow("Suspicious activity span", data.activity_span_human));
+  body.appendChild(head);
+
+  // The two numbers measure different things and the panel says so:
+  // 'total' is what the engine acts on (it decays), while the component
+  // points below are history (they never decay). Showing both, labeled,
+  // is the whole point - no unexplained numbers anywhere.
+  body.appendChild(modalNote("Component points are raw contributions (history); the live score decays ~20 pts/min. Shares are of raw contributions."));
+
+  if (!data.components || data.components.length === 0) {
+    body.appendChild(modalNote("Score exists but no attributed components remain (decayed or rescored)."));
+    return;
+  }
+  for (const c of data.components) {
+    const row = el("div", { className: "comp-row" });
+    const label = el("div", { className: "comp-label" });
+    label.appendChild(el("span", { text: c.check_id, className: "comp-id" }));
+    label.appendChild(el("span", {
+      text: `+${c.points} pts × ${c.hits} hit${c.hits === 1 ? "" : "s"} · ${c.share}%`,
+      className: "comp-points",
+    }));
+    row.appendChild(label);
+    const barOuter = el("div", { className: "comp-bar" });
+    const barInner = el("div", { className: "comp-bar-fill" });
+    barInner.style.width = `${Math.max(2, Math.min(100, c.share))}%`;
+    barOuter.appendChild(barInner);
+    row.appendChild(barOuter);
+    row.appendChild(el("div", { text: c.context, className: "comp-context" }));
+    body.appendChild(row);
+  }
+}
+
+async function openLive(pid) {
+  const body = openModal(`Live Process Status — PID ${pid}`);
+  body.appendChild(modalNote("Querying the live agent (same process as this dashboard)..."));
+  const data = await fetchModalJSON(
+    `/api/processes/${pid}/live`, body,
+    `PID ${pid} could not be queried (already exited, or never existed).`
+  );
+  if (!data) return;
+  clear(body);
+
+  const head = el("div", { className: "live-head" });
+  head.appendChild(el("span", {
+    text: data.alive ? "ALIVE" : "DEAD",
+    className: `badge ${data.alive ? "badge-ok" : "badge-off"}`,
+  }));
+  head.appendChild(kvRow("Name", data.name));
+  head.appendChild(kvRow("Status", data.status));
+  head.appendChild(kvRow("Threads", data.num_threads));
+  head.appendChild(kvRow("Memory RSS/VM", data.rss != null ? `${(data.rss / 1048576).toFixed(1)} / ${(data.vms / 1048576).toFixed(1)} MB` : "—"));
+  body.appendChild(head);
+
+  if (data.denied && data.denied.length) {
+    body.appendChild(modalNote(`Fields denied by the OS for this process: ${data.denied.join(", ")} (elevated/protected process - that itself is an answer).`));
+  }
+
+  body.appendChild(modalHeading("Open files"));
+  if (data.open_files == null) {
+    body.appendChild(modalNote("unavailable (denied)"));
+  } else if (data.open_files.length === 0) {
+    body.appendChild(modalNote("none open at this instant"));
+  } else {
+    const list = el("ul", { className: "live-list" });
+    for (const f of data.open_files) list.appendChild(el("li", { text: f.path }));
+    body.appendChild(list);
+  }
+
+  body.appendChild(modalHeading("Network connections"));
+  if (data.net_connections == null) {
+    body.appendChild(modalNote("unavailable (denied)"));
+  } else if (data.net_connections.length === 0) {
+    body.appendChild(modalNote("none open at this instant"));
+  } else {
+    const list = el("ul", { className: "live-list mono" });
+    for (const c of data.net_connections) {
+      list.appendChild(el("li", { text: `${c.laddr || "*"} → ${c.raddr || "*"} (${c.status})` }));
+    }
+    body.appendChild(list);
+  }
+
+  body.appendChild(modalHeading("Memory maps"));
+  body.appendChild(modalNote(data.memory_maps_count == null ? "unavailable (denied)" : `${data.memory_maps_count} mapped regions`));
+
+  const refresh = el("button", { text: "Refresh", className: "btn btn-small" });
+  refresh.addEventListener("click", () => openLive(pid));
+  body.appendChild(refresh);
+}
+
+async function openChain(pid) {
+  const body = openModal(`Memory Ancestry Graph — PID ${pid}`);
+  body.appendChild(modalNote("Reconstructing the attack chain..."));
+  const data = await fetchModalJSON(
+    `/api/processes/${pid}/ancestry`, body,
+    `No ancestry or forensic snapshot recorded for PID ${pid}.`
+  );
+  if (!data) return;
+  clear(body);
+
+  const snap = data.forensic_snapshot;
+  if (snap) {
+    const snapBox = el("div", { className: "snap-box" });
+    snapBox.appendChild(kvRow("Captured at", new Date(snap.taken_at * 1000).toLocaleString()));
+    snapBox.appendChild(kvRow("Trigger", snap.trigger));
+    snapBox.appendChild(kvRow("Score at capture", snap.score_at_capture));
+    snapBox.appendChild(kvRow("Activity span", snap.activity_span_human));
+    if (snap.trigger_edge) {
+      snapBox.appendChild(kvRow("Connection edge", `${snap.trigger_edge.label} → ${snap.trigger_edge.target_image || `pid ${snap.trigger_edge.to}`}`));
+    }
+    if (snap.chain_summary) snapBox.appendChild(kvRow("Chain summary", snap.chain_summary));
+    if (snap.ancestry_note) snapBox.appendChild(modalNote(`Ancestry: ${snap.ancestry_note}`));
+    body.appendChild(snapBox);
+  }
+
+  const ancestry = data.ancestry;
+  if (!ancestry || !ancestry.nodes || ancestry.nodes.length === 0) {
+    body.appendChild(modalNote(
+      snap
+        ? "The forensic snapshot above is the surviving evidence - the live lineage tracker no longer has this chain (evicted, or the agent restarted)."
+        : "No ancestry nodes recorded - the tracker never observed this PID or its ancestors."
+    ));
+    return;
+  }
+
+  if (ancestry.incomplete) {
+    body.appendChild(modalNote("Chain is PARTIAL - the walk stopped at an untracked ancestor, a cycle, or the depth cap. Edges below are what was observed."));
+  }
+
+  // Render the chain oldest-first: each node indented under its parent,
+  // with the connecting edge label on the connector line (EXEC for a
+  // process-create link; the forensic snapshot's access edge, if any, is
+  // shown in the snapshot box above since it is not a parentage relation).
+  const tree = el("div", { className: "chain-tree" });
+  ancestry.nodes.forEach((node, i) => {
+    const nodeBox = el("div", { className: "chain-node" });
+    nodeBox.style.marginLeft = `${Math.min(i, 6) * 18}px`;
+
+    const edgeToHere = ancestry.edges.find((e) => e.to === node.pid);
+    const edgeLabel = edgeToHere ? `—[${edgeToHere.label}]→ ` : "";
+    const title = el("div", { className: "chain-title" });
+    title.appendChild(el("span", { text: `${edgeLabel}${node.image || `pid:${node.pid}`}`, className: "chain-image" }));
+    title.appendChild(el("span", { text: `PID ${node.pid}${node.alive ? "" : " (exited)"}`, className: "chain-pid" }));
+    nodeBox.appendChild(title);
+
+    const details = el("div", { className: "chain-details" });
+    if (node.command_line) details.appendChild(kvRow("Command line", node.command_line));
+    if (node.user) details.appendChild(kvRow("User", node.user));
+    if (node.spawn_time) details.appendChild(kvRow("Spawn time", node.spawn_time));
+    if (node.first_seen) details.appendChild(kvRow("First seen by agent", new Date(node.first_seen * 1000).toLocaleString()));
+    if (node.env_vars) {
+      const envCount = Object.keys(node.env_vars).length;
+      details.appendChild(kvRow("Environment variables", `${envCount} captured`));
+      const envList = el("ul", { className: "live-list mono env-list" });
+      Object.entries(node.env_vars).slice(0, 15).forEach(([k, v]) => {
+        envList.appendChild(el("li", { text: `${k}=${v}` }));
+      });
+      details.appendChild(envList);
+      if (envCount > 15) details.appendChild(modalNote(`…and ${envCount - 15} more variables`));
+    } else if (node.env_note) {
+      details.appendChild(kvRow("Environment", node.env_note));
+    }
+    if (details.childNodes.length) nodeBox.appendChild(details);
+    tree.appendChild(nodeBox);
+  });
+  body.appendChild(tree);
+}

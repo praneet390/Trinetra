@@ -385,6 +385,182 @@ def test_dashboard_server_refuses_to_share_a_port():
     assert ws.DashboardServer.allow_reuse_address is False
 
 
+def test_backend_wires_ancestry_provider_for_forensic_snapshots():
+    backend = ws.Backend()
+    # The engine's detection-time ancestry capture must walk THIS backend's
+    # lineage tracker - the same graph the Process Explorer Lineage column
+    # renders - so snapshots and the UI can never disagree.
+    assert backend.engine.ancestry_provider == backend.process_tracker.get_ancestry
+
+
+def test_breakdown_endpoint_returns_attributed_components():
+    backend = ws.Backend()
+    pid = 777001  # arbitrary fake PID; Backend's engine is not wired to live sensors
+    backend.engine._add_score(pid, 30, 'staging dir exec', check_id='staging_dir')
+    payload, status = ws.api_process_breakdown(backend.engine, str(pid))
+    assert status == 200
+    assert payload['pid'] == pid
+    assert payload['components'][0]['check_id'] == 'staging_dir'
+    assert payload['components'][0]['points'] == 30
+    assert payload['thresholds']['warning'] == backend.config['thresholds']['warning']
+    assert 'forensic_snapshot' in payload
+
+
+def test_breakdown_endpoint_404_for_unscored_pid():
+    backend = ws.Backend()
+    payload, status = ws.api_process_breakdown(backend.engine, '777002')
+    assert status == 404
+    assert 'error' in payload
+
+
+def test_breakdown_endpoint_400_for_garbage_pid():
+    backend = ws.Backend()
+    payload, status = ws.api_process_breakdown(backend.engine, 'not-a-pid')
+    assert status == 400
+
+
+def test_live_endpoint_reports_a_live_process(monkeypatch):
+    class _FakeAddr:
+        def __init__(self, ip, port):
+            self.ip, self.port = ip, port
+
+    class _FakeConn:
+        fd = 99
+        laddr = _FakeAddr('127.0.0.1', 4444)
+        raddr = _FakeAddr('10.0.0.5', 80)
+        status = 'ESTABLISHED'
+
+    class _FakeMem:
+        rss, vms = 1048576, 2097152
+
+    class _FakeMap:
+        def __init__(self, path):
+            self.path = path
+
+    class _FakeFile:
+        def __init__(self, path):
+            self.path, self.fd = path, 7
+
+    class _FakeProc:
+        def name(self):
+            return 'implant.exe'
+        def status(self):
+            return 'running'
+        def create_time(self):
+            return 1000.0
+        def num_threads(self):
+            return 4
+        def memory_info(self):
+            return _FakeMem()
+        def open_files(self):
+            return [_FakeFile(r'C:\Temp\staged.dll')]
+        def net_connections(self):
+            return [_FakeConn()]
+        def memory_maps(self):
+            return [_FakeMap('a.dll'), _FakeMap('b.dll')]
+
+    monkeypatch.setattr(ws.psutil, 'Process', lambda pid: _FakeProc())
+    payload, status = ws.api_process_live('777003')
+    assert status == 200
+    assert payload['alive'] is True
+    assert payload['name'] == 'implant.exe'
+    assert payload['num_threads'] == 4
+    assert payload['open_files'][0]['path'] == r'C:\Temp\staged.dll'
+    assert payload['net_connections'][0]['raddr'] == '10.0.0.5:80'
+    assert payload['memory_maps_count'] == 2
+    assert payload['denied'] == []
+
+
+def test_live_endpoint_reports_partial_denial_without_failing(monkeypatch):
+    # Elevated/protected processes deny individual reads; 'alive but locked
+    # down' is the analyst's answer, so denied fields are marked, not fatal.
+    class _DeniedProc:
+        def name(self):
+            return 'protected.exe'
+        def status(self):
+            raise ws.psutil.AccessDenied()
+        def create_time(self):
+            raise ws.psutil.AccessDenied()
+        def num_threads(self):
+            raise ws.psutil.AccessDenied()
+        def memory_info(self):
+            raise ws.psutil.AccessDenied()
+        def open_files(self):
+            raise ws.psutil.AccessDenied()
+        def net_connections(self):
+            raise ws.psutil.AccessDenied()
+        def memory_maps(self):
+            raise ws.psutil.AccessDenied()
+
+    monkeypatch.setattr(ws.psutil, 'Process', lambda pid: _DeniedProc())
+    payload, status = ws.api_process_live('777004')
+    assert status == 200
+    assert payload['alive'] is True
+    assert payload['name'] == 'protected.exe'
+    assert 'net_connections' in payload['denied']
+    assert payload['net_connections'] is None
+
+
+def test_live_endpoint_404_for_dead_pid(monkeypatch):
+    def _gone(pid):
+        raise ws.psutil.NoSuchProcess(pid)
+    monkeypatch.setattr(ws.psutil, 'Process', _gone)
+    payload, status = ws.api_process_live('777005')
+    assert status == 404
+    assert payload['alive'] is False
+
+
+def test_live_endpoint_400_for_garbage_pid():
+    payload, status = ws.api_process_live('abc')
+    assert status == 400
+
+
+def test_ancestry_endpoint_merges_tracker_and_snapshot():
+    backend = ws.Backend()
+    pid = 777006
+    backend.process_tracker.add(1, {'ProcessId': '1', 'ParentProcessId': None, 'Image': 'explorer.exe'})
+    backend.process_tracker.add(1, {'ProcessId': str(pid), 'ParentProcessId': '1',
+                                    'Image': 'evil.exe', 'CommandLine': 'evil.exe --go'})
+    backend.engine._add_score(pid, 60, 'staging dir exec', check_id='staging_dir')  # crosses warning(50) -> snapshot
+    payload, status = ws.api_process_ancestry(backend, str(pid))
+    assert status == 200
+    ancestry = payload['ancestry']
+    assert [n['pid'] for n in ancestry['nodes']] == [1, pid]
+    assert ancestry['edges'] == [{'from': 1, 'to': pid, 'label': 'EXEC'}]
+    assert payload['forensic_snapshot']['trigger'] == 'warning_threshold'
+    assert payload['forensic_snapshot']['chain_summary'] == 'explorer.exe -> evil.exe'
+
+
+def test_ancestry_endpoint_snapshot_only_for_evicted_tracker_entries():
+    # A PID whose tracker entries were evicted but whose forensic snapshot
+    # survives must still return 200 - the snapshot IS the evidence copy.
+    backend = ws.Backend()
+    pid = 777007
+    backend.engine.forensic_snapshots[pid] = {
+        'pid': pid, 'taken_at': 0.0, 'trigger': 'critical_threshold',
+        'score_at_capture': 90, 'activity_span_seconds': None,
+        'activity_span_human': None, 'chain_summary': None,
+        'ancestry': None, 'ancestry_note': 'test', 'trigger_edge': None,
+        'components_at_capture': [],
+    }
+    payload, status = ws.api_process_ancestry(backend, str(pid))
+    assert status == 200
+    assert payload['ancestry'] is None
+    assert payload['forensic_snapshot']['trigger'] == 'critical_threshold'
+
+
+def test_ancestry_endpoint_404_when_neither_source_knows_the_pid():
+    backend = ws.Backend()
+    payload, status = ws.api_process_ancestry(backend, '777008')
+    assert status == 404
+
+
+def test_ancestry_endpoint_400_for_garbage_pid():
+    backend = ws.Backend()
+    payload, status = ws.api_process_ancestry(backend, '')
+    assert status == 400
+
+
 if __name__ == "__main__":
     test_relaunch_success_uses_absolute_script_path_and_cwd()
     test_relaunch_declined_returns_false()

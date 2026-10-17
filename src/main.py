@@ -11,6 +11,7 @@ from rule_engine import RuleEngine
 from sensor_health import SensorHealth, watchdog_loop, current_blind_state
 from detection_config import load_config
 from self_test import RecentPidSightings, self_test_loop
+from process_tracker import ProcessTracker
 
 MODULE_SWEEP_INTERVAL_SECONDS = 30
 
@@ -88,7 +89,25 @@ def main():
     # threads above are alive. Nothing else in this headless entrypoint
     # uses HeuristicEngine.on_event, so it's free to claim exclusively here.
     sightings = RecentPidSightings()
-    engine.on_event = sightings.observe
+    # Process ancestry tracker (see process_tracker.py) - the same class the
+    # dashboard wires, so the headless entrypoint builds identical forensic
+    # ancestry snapshots when a detection crosses a threshold. engine.on_event
+    # supports exactly ONE observer, so both consumers (self-test sightings
+    # and the tracker) hang off this small fan-out - the same shape
+    # web_server.py's _on_raw_event uses, kept inline here because the
+    # headless entrypoint has no Backend to own it.
+    tracker = ProcessTracker()
+
+    def _observe_raw_event(event_id, data):
+        sightings.observe(event_id, data)
+        tracker.add(event_id, data)
+
+    engine.on_event = _observe_raw_event
+    # Forensic snapshots at detection time now walk the tracker's parent/
+    # child map (see heuristic_engine._capture_forensic_snapshot) - same
+    # wiring web_server.py performs, so both entrypoints produce identical
+    # Memory Ancestry Graph evidence.
+    engine.ancestry_provider = tracker.get_ancestry
     threading.Thread(
         target=self_test_loop,
         args=(sightings.seen,),

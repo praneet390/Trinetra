@@ -188,6 +188,20 @@
   </section>
 </main>
 
+<!-- Detection-forensics modal: one shared shell for the Score Breakdown,
+     Live Process Status and Memory Ancestry panels. Rendered exclusively
+     with textContent (same XSS discipline as the tables - alert data can
+     carry attacker-controlled command lines). -->
+<div id="modalBackdrop" class="modal-backdrop" style="display:none">
+  <div class="modal">
+    <div class="modal-head">
+      <h3 id="modalTitle">—</h3>
+      <button id="modalClose" class="btn btn-small" title="Close">✕</button>
+    </div>
+    <div id="modalBody" class="modal-body"></div>
+  </div>
+</div>
+
 <div class="footer-note">
   Prototype tool — demonstration build. Static analysis parses PE structure only and never executes a sample; live detections are sourced from Sysmon and raw ETW kernel telemetry on this host. Not a certified forensic acquisition product; findings should be independently verified before use in an investigation.
 </div>

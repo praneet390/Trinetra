@@ -418,6 +418,70 @@ Matching Sigma rules for the Sysmon-driven detections live in
 detections live in [`rules/static.yar`](rules/static.yar) and
 [`rules/family_signatures.yar`](rules/family_signatures.yar).
 
+## Detection forensics: ancestry, breakdown, live status, dwell time
+
+Four evidence capabilities sit on top of the scoring engine, all additive —
+none of them change what gets detected or mitigated, only what is recorded
+about the detections the engine already makes.
+
+**Memory Ancestry Graph** (`src/process_tracker.py` +
+`heuristic_engine._capture_forensic_snapshot`). The moment a PID first
+crosses the warning or critical threshold (or someone requests its
+mitigation), the engine captures a forensic snapshot: the full known
+ancestor chain — PID, PPID, image, command line, user, spawn time, and the
+time this agent first observed each node — with every parent→child edge
+labeled `EXEC`, plus any recent process-*access* edge the PID originated
+(e.g. `OpenProcess(0x143a)` against lsass.exe — the Windows analog of an
+`MMAP(RWX)` edge: how a tool connected to its victim, as opposed to how it
+was born). Snapshots are taken **once per PID** (the first threshold
+crossing wins — escalation does not rewrite evidence) and **survive
+mitigation and process death on purpose**: by the time a human opens the
+alert, `mitigate()` may long since have terminated the process, and a dead
+process's ancestry is unrecoverable from psutil. Environment variables are
+captured best-effort, only for still-alive ancestors, only when the panel
+is opened — a dead ancestor reports `environment unrecoverable: process has
+exited` instead of a silent null. Every chain reports whether it is
+complete or partial (`incomplete`), so a truncated walk is never mistaken
+for a full one. The headless CLI entrypoint wires the same tracker the
+dashboard does, so both entrypoints produce identical evidence.
+
+**Score Breakdown Panel** (`HeuristicEngine.score_breakdown` /
+`/api/processes/<pid>/breakdown`). Every behavioral and static finding now
+carries a `check_id` through the engine's single `_add_score()` /
+`add_static_score()` choke points, and each PID's (and sample hash's)
+components are kept as merged history: which check contributed how many
+points, how many times, with its most recent reason. The panel shows the
+live (decayed) total next to the raw contribution sum — the two are
+deliberately labeled as different numbers, since components are history
+and never decay while the live score does — plus an evidence-derived
+**suspicious-activity span** (monotonic time since this PID's first
+contribution). Shares are computed against the raw sum so the bars always
+sum to 100%.
+
+**Live Agent Feedback** (`/api/processes/<pid>/live`). One click answers
+"is the attacker still inside right now": alive/dead, name, status,
+threads, memory, open files, active network connections, and mapped-module
+count — a single psutil snapshot taken inside the request. Individual
+reads an OS denies (elevated/protected processes) come back listed under
+`denied` rather than failing the whole answer, because "alive but locked
+down" is itself an answer.
+
+**Module dwell time** (`src/module_inspector.py`). The active sweep now
+keeps a bounded first-seen ledger for every suspicious-path module it
+observes, and every flagged finding reports how long that module has been
+resident (`- resident for 18d 3h 4m`), with the provenance stated in the
+payload (`dwell_source: agent_first_observation`) — the figure starts when
+*this agent* first saw the module, which bounds (but does not overclaim)
+true load time. The dwell record refreshes on every sweep, so the API
+always reports current residency; the score still fires exactly once per
+module.
+
+All four stores are bounded (components per PID/hash, snapshots, access
+edges, dwell ledger — same LRU discipline as every other buffer here), and
+the dashboard exposes the first three as per-row **Breakdown / Live /
+Chain** buttons in the Endpoint Processes table, rendered textContent-only
+(detection payloads carry attacker-controlled strings).
+
 ## Threat intel sync (MalwareBazaar)
 
 [`tools/threat_intel_sync.py`](tools/threat_intel_sync.py) pulls **metadata
@@ -844,9 +908,10 @@ mal_project/
 │   ├── module_inspector.py Active live-process module sweep
 │   ├── rule_engine.py       Additive YAML rule pack (rules/custom/*.yml) - see Custom detection rules
 │   ├── detection_config.py  Config-driven tunables (config/detection.yml) - decay/thresholds/ransomware window
-│   ├── process_tracker.py   Parent/child process lineage (Velociraptor pattern) for Process Explorer
+│   ├── process_tracker.py   Parent/child lineage + full ancestry graph (PID/PPID/cmdline/user/spawn time, EXEC edges) for Process Explorer & forensic snapshots
 │   ├── web_server.py        Dashboard entry point - same wiring as main.py + JSON API, self-elevates
 │   ├── dashboard_data.py    Pure data-shaping (severity/category, chart/table rows) for web_server.py
+│   ├── conftest.py          Pytest bootstrap: stand-ins for Windows-only imports so the suite runs off-Windows too
 │   ├── webapp/              Dashboard frontend (HTML/CSS/JS, Chart.js via CDN)
 │   └── test_*.py            Self-checks (synthetic-XML rule tests, static-scan fixtures, mocked sweeps) - `python test_x.py`
 ├── tools/

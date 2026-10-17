@@ -17,6 +17,7 @@ import json
 import time
 import ctypes
 import logging
+import psutil
 import socket
 import subprocess
 import threading
@@ -57,6 +58,157 @@ STATIC_CONTENT_TYPES = {
 }
 
 PID_TERMINATE_RE = re.compile(r"^/api/processes/(\d+)/terminate$")
+# Detection-forensics API routes. PIDs are parsed as strictly-numeric path
+# segments - a non-numeric PID is a client error (400), not a 500, and the
+# regexes make the routing unambiguous against each other.
+PID_BREAKDOWN_RE = re.compile(r"^/api/processes/(\d+)/breakdown$")
+PID_LIVE_RE = re.compile(r"^/api/processes/(\d+)/live$")
+PID_ANCESTRY_RE = re.compile(r"^/api/processes/(\d+)/ancestry$")
+
+
+def api_process_breakdown(engine, pid_str):
+    """GET /api/processes/<pid>/breakdown - the Score Breakdown Panel feed.
+
+    Module-level so tests (and future entrypoints) can exercise the payload
+    without standing up an HTTP server. Returns (payload, http_status).
+    404 for a PID the engine has never scored - 'no score yet' and 'no such
+    PID' are deliberately the same answer to an analyst: there is nothing
+    to explain yet."""
+    try:
+        pid = int(pid_str)
+    except (TypeError, ValueError):
+        return {"error": "invalid pid"}, 400
+    breakdown = engine.score_breakdown(pid)
+    if breakdown is None:
+        return {"error": "no score recorded for this pid"}, 404
+    return breakdown, 200
+
+
+def api_process_live(pid_str):
+    """GET /api/processes/<pid>/live - the Live Agent Feedback feed.
+
+    Answers, for the PID an alert is about: is it still alive RIGHT NOW,
+    what is it called, how many threads, how much memory, which files does
+    it hold open, which network connections does it have, and how many
+    mapped modules. All of it is a single psutil snapshot taken inside this
+    request - the dashboard polls it on demand (per analyst click), which
+    keeps the 'respond within two seconds' contract trivial: there is no
+    agent round-trip because the agent and the dashboard are one process.
+
+    Failure model: every psutil read is individually guarded. An elevated
+    or protected process typically denies open_files/net_connections/
+    memory_maps - those come back as null plus a `denied` list instead of
+    failing the whole response, because 'alive, but locked down' is itself
+    the analyst's answer. A dead process is 404 with its capture-time name
+    when psutil can still tell us anything, or a bare 404 when it cannot.
+
+    Module-level for the same testability reason as api_process_breakdown;
+    psutil is imported at module top so tests monkeypatch the same object
+    the handler path uses."""
+    try:
+        pid = int(pid_str)
+    except (TypeError, ValueError):
+        return {"error": "invalid pid"}, 400
+
+    try:
+        proc = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return {"error": "process not found (already exited)", "pid": pid, "alive": False}, 404
+    except psutil.AccessDenied:
+        # The process EXISTS (AccessDenied is a visibility result, not an
+        # absence result) - answer what we know and mark the rest denied.
+        return {
+            "pid": pid, "alive": True, "status": "unknown",
+            "denied": ["name", "open_files", "net_connections", "memory_maps", "memory_info"],
+        }, 200
+
+    payload = {
+        "pid": pid,
+        "alive": True,
+        "denied": [],
+    }
+    try:
+        payload["name"] = proc.name()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        payload["name"] = None
+        payload["denied"].append("name")
+    try:
+        payload["status"] = proc.status()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        payload["status"] = None
+        payload["denied"].append("status")
+    try:
+        payload["create_time"] = proc.create_time()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        payload["create_time"] = None
+        payload["denied"].append("create_time")
+    try:
+        payload["num_threads"] = proc.num_threads()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        payload["num_threads"] = None
+        payload["denied"].append("num_threads")
+    try:
+        mem = proc.memory_info()
+        payload["rss"] = mem.rss
+        payload["vms"] = mem.vms
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        payload["rss"] = payload["vms"] = None
+        payload["denied"].append("memory_info")
+    try:
+        payload["open_files"] = [
+            {"path": f.path, "fd": f.fd}
+            for f in proc.open_files()
+        ]
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        payload["open_files"] = None
+        payload["denied"].append("open_files")
+    try:
+        payload["net_connections"] = [
+            {"fd": c.fd, "laddr": f"{c.laddr.ip}:{c.laddr.port}" if c.laddr else None,
+             "raddr": f"{c.raddr.ip}:{c.raddr.port}" if c.raddr else None,
+             "status": c.status}
+            for c in proc.net_connections()
+        ]
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        payload["net_connections"] = None
+        payload["denied"].append("net_connections")
+    try:
+        maps = proc.memory_maps()
+        payload["memory_maps_count"] = len(maps)
+        # Paths only - full map dumps belong in a forensic tool, not a
+        # status panel; and non-Windows hosts emit POSIX-style paths, so no
+        # normalization is attempted here, the path is shown verbatim.
+        payload["memory_maps_sample"] = [m.path for m in maps[:20]]
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        payload["memory_maps_count"] = None
+        payload["memory_maps_sample"] = None
+        payload["denied"].append("memory_maps")
+    return payload, 200
+
+
+def api_process_ancestry(backend, pid_str):
+    """GET /api/processes/<pid>/ancestry - the Memory Ancestry Graph feed.
+
+    Returns the FULL ancestry (every known ancestor with PID/PPID/command
+    line/user/spawn time/first-seen, EXEC-labeled edges, best-effort env
+    blocks for still-alive nodes) plus the engine's forensic snapshot for
+    the PID if one was captured at detection time - the snapshot is what
+    survives mitigation, so the panel shows it whenever it exists even for
+    a now-dead process. 404 when NEITHER source knows the PID."""
+    try:
+        pid = int(pid_str)
+    except (TypeError, ValueError):
+        return {"error": "invalid pid"}, 400
+
+    ancestry = backend.process_tracker.get_ancestry(pid, include_env=True)
+    snapshot = backend.engine.forensic_snapshots.get(pid)
+    if ancestry is None and snapshot is None:
+        return {"error": "no ancestry or forensic snapshot recorded for this pid", "pid": pid}, 404
+    return {
+        "pid": pid,
+        "ancestry": ancestry,
+        "forensic_snapshot": snapshot,
+    }, 200
 
 
 class AlertStore:
@@ -158,6 +310,12 @@ class Backend:
         self.engine.correlator = self.correlator
         self.sysmon_health = SensorHealth("sysmon")
         self.etw_health = SensorHealth("etw")
+        # Wire the Memory Ancestry Graph provider: when the engine captures
+        # a forensic snapshot at detection time it walks THIS tracker's
+        # parent/child map (the same one feeding the Process Explorer
+        # Lineage column) via this callback - same after-the-fact wiring
+        # pattern as engine.correlator above.
+        self.engine.ancestry_provider = self.process_tracker.get_ancestry
 
     def _on_raw_event(self, event_id, data):
         """Single fan-out point for HeuristicEngine.on_event - every raw
@@ -368,6 +526,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/rules":
             self._send_json(backend.rules.summary())
         else:
+            # Detection-forensics routes (see the *_RE regexes above). The
+            # helpers return (payload, status) so error shapes are tested
+            # without an HTTP server.
+            breakdown = PID_BREAKDOWN_RE.match(path)
+            if breakdown:
+                payload, status = api_process_breakdown(backend.engine, breakdown.group(1))
+                self._send_json(payload, status)
+                return
+            live = PID_LIVE_RE.match(path)
+            if live:
+                payload, status = api_process_live(live.group(1))
+                self._send_json(payload, status)
+                return
+            ancestry = PID_ANCESTRY_RE.match(path)
+            if ancestry:
+                payload, status = api_process_ancestry(backend, ancestry.group(1))
+                self._send_json(payload, status)
+                return
             self._send_json({"error": "not found"}, 404)
 
     def do_POST(self):
