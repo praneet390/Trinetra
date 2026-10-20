@@ -17,6 +17,8 @@ import json
 import time
 import ctypes
 import logging
+import psutil
+import socket
 import subprocess
 import threading
 import urllib.request
@@ -29,13 +31,18 @@ from urllib.parse import urlsplit, parse_qs
 from heuristic_engine import HeuristicEngine
 from static_scanner import StaticScanner
 from telemetry_monitor import start_monitor
-from etw_monitor import start_etw_monitor
+from etw_monitor import start_etw_monitor, stop_etw_monitor
 from module_inspector import ModuleInspector
 from process_correlator import ProcessCorrelator
 from rule_engine import RuleEngine
-from sensor_health import SensorHealth, watchdog_loop
+from sensor_health import (
+    SensorHealth, watchdog_loop, sensor_label, current_blind_state,
+    negative_evidence_caveat, BLIND_STATE_HEALTHY,
+)
 from detection_config import load_config
+from self_test import self_test_loop
 from process_tracker import ProcessTracker
+from hands_on import is_hands_on_message, HANDS_ON_LABEL
 import dashboard_data as dd
 
 HOST = "127.0.0.1"  # loopback only - this server exposes a process-kill endpoint
@@ -52,12 +59,178 @@ STATIC_CONTENT_TYPES = {
 }
 
 PID_TERMINATE_RE = re.compile(r"^/api/processes/(\d+)/terminate$")
+# Detection-forensics API routes. PIDs are parsed as strictly-numeric path
+# segments - a non-numeric PID is a client error (400), not a 500, and the
+# regexes make the routing unambiguous against each other.
+PID_LIVE_RE = re.compile(r"^/api/processes/(\d+)/live$")
+PID_ANCESTRY_RE = re.compile(r"^/api/processes/(\d+)/ancestry$")
+
+
+def api_process_live(pid_str):
+    """GET /api/processes/<pid>/live - the Live Agent Feedback feed.
+
+    Answers, for the PID an alert is about: is it still alive RIGHT NOW,
+    what is it called, how many threads, how much memory, which files does
+    it hold open, which network connections does it have, and how many
+    mapped modules. All of it is a single psutil snapshot taken inside this
+    request - the dashboard polls it on demand (per analyst click), which
+    keeps the 'respond within two seconds' contract trivial: there is no
+    agent round-trip because the agent and the dashboard are one process.
+
+    Failure model: every psutil read is individually guarded. An elevated
+    or protected process typically denies open_files/net_connections/
+    memory_maps - those come back as null plus a `denied` list instead of
+    failing the whole response, because 'alive, but locked down' is itself
+    the analyst's answer. A dead process is 404 with its capture-time name
+    when psutil can still tell us anything, or a bare 404 when it cannot.
+
+    Module-level for the same testability reason as api_process_ancestry;
+    psutil is imported at module top so tests monkeypatch the same object
+    the handler path uses."""
+    try:
+        pid = int(pid_str)
+    except (TypeError, ValueError):
+        return {"error": "invalid pid"}, 400
+
+    try:
+        proc = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return {"error": "process not found (already exited)", "pid": pid, "alive": False}, 404
+    except psutil.AccessDenied:
+        # The process EXISTS (AccessDenied is a visibility result, not an
+        # absence result) - answer what we know and mark the rest denied.
+        return {
+            "pid": pid, "alive": True, "status": "unknown",
+            "denied": ["name", "open_files", "net_connections", "memory_maps", "memory_info"],
+        }, 200
+
+    payload = {
+        "pid": pid,
+        "alive": True,
+        "denied": [],
+    }
+    try:
+        payload["name"] = proc.name()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        payload["name"] = None
+        payload["denied"].append("name")
+    try:
+        payload["status"] = proc.status()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        payload["status"] = None
+        payload["denied"].append("status")
+    try:
+        payload["create_time"] = proc.create_time()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        payload["create_time"] = None
+        payload["denied"].append("create_time")
+    try:
+        payload["num_threads"] = proc.num_threads()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        payload["num_threads"] = None
+        payload["denied"].append("num_threads")
+    try:
+        mem = proc.memory_info()
+        payload["rss"] = mem.rss
+        payload["vms"] = mem.vms
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        payload["rss"] = payload["vms"] = None
+        payload["denied"].append("memory_info")
+    try:
+        payload["open_files"] = [
+            {"path": f.path, "fd": f.fd}
+            for f in proc.open_files()
+        ]
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        payload["open_files"] = None
+        payload["denied"].append("open_files")
+    try:
+        payload["net_connections"] = [
+            {"fd": c.fd, "laddr": f"{c.laddr.ip}:{c.laddr.port}" if c.laddr else None,
+             "raddr": f"{c.raddr.ip}:{c.raddr.port}" if c.raddr else None,
+             "status": c.status}
+            for c in proc.net_connections()
+        ]
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        payload["net_connections"] = None
+        payload["denied"].append("net_connections")
+    try:
+        maps = proc.memory_maps()
+        payload["memory_maps_count"] = len(maps)
+        # Paths only - full map dumps belong in a forensic tool, not a
+        # status panel; and non-Windows hosts emit POSIX-style paths, so no
+        # normalization is attempted here, the path is shown verbatim.
+        payload["memory_maps_sample"] = [m.path for m in maps[:20]]
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        payload["memory_maps_count"] = None
+        payload["memory_maps_sample"] = None
+        payload["denied"].append("memory_maps")
+    return payload, 200
+
+
+def api_process_ancestry(backend, pid_str):
+    """GET /api/processes/<pid>/ancestry - the Memory Ancestry Graph feed.
+
+    Returns the FULL ancestry (every known ancestor with PID/PPID/command
+    line/user/spawn time/first-seen, EXEC-labeled edges, best-effort env
+    blocks for still-alive nodes) plus the engine's forensic snapshot for
+    the PID if one was captured at detection time - the snapshot is what
+    survives mitigation, so the panel shows it whenever it exists even for
+    a now-dead process. 404 when NEITHER source knows the PID.
+
+    COMPLETE-CHAIN MERGE: the graph presented here is the full attack
+    chain, not two artifacts. Access edges (MMAP(RWX)/CREATETHREAD/
+    OpenProcess - Sysmon Event 10 connections) live in the engine's own
+    bounded store and can be observed AFTER the threshold snapshot was
+    frozen (snapshots are first-wins evidence and are never rewritten), so
+    this endpoint merges the engine's current access edge into the
+    presented ancestry as a kind='access' edge. The merge only ever ADDS
+    the observed connection - birth edges stay EXEC-labeled from the
+    tracker, the stored snapshot stays untouched, and if no access edge
+    was ever observed the graph is exactly what the trackers recorded."""
+    try:
+        pid = int(pid_str)
+    except (TypeError, ValueError):
+        return {"error": "invalid pid"}, 400
+
+    ancestry = backend.process_tracker.get_ancestry(pid, include_env=True)
+    snapshot = backend.engine.forensic_snapshots.get(pid)
+    if ancestry is None and snapshot is None:
+        return {"error": "no ancestry or forensic snapshot recorded for this pid", "pid": pid}, 404
+
+    if isinstance(ancestry, dict):
+        # Prefer the engine's live edge store (the most recent
+        # observation); fall back to the snapshot's frozen trigger_edge
+        # for the case where the bounded LRU already evicted it but the
+        # snapshot preserved a copy. Never duplicates: a graph that
+        # already carries a kind='access' edge is complete.
+        edge = backend.engine._access_edge_for(pid) or (snapshot or {}).get('trigger_edge')
+        if edge is not None and not any(e.get('kind') == 'access' for e in ancestry.get('edges', [])):
+            merged = dict(edge)
+            merged['kind'] = 'access'
+            ancestry.setdefault('edges', []).append(merged)
+
+    return {
+        "pid": pid,
+        "ancestry": ancestry,
+        "forensic_snapshot": snapshot,
+    }, 200
 
 
 class AlertStore:
     """Thread-safe, bounded buffer of structured alerts, fed by a logging
     handler attached to the root logger - every finding the engine/scanner/
-    monitor/inspector already log becomes a dashboard alert for free."""
+    monitor/inspector already log becomes a dashboard alert for free.
+
+    HANDS-ON THREAT classification: any log message carrying the
+    hands_on.HANDS_ON_TAG marker (see hands_on.py - emitted by the static
+    scanner when a finding positively identifies a Cobalt Strike stager)
+    is stored with hands_on=True + classification='HANDS-ON THREAT', and
+    snapshot() pins those alerts to the TOP of the queue regardless of
+    timestamp. The rationale: the most dangerous class of detection must
+    be impossible to miss - a hands-on alert that arrived an hour ago and
+    has since been buried under thirty benign INFO lines is exactly the
+    alert that gets missed during an active intrusion."""
 
     def __init__(self, maxlen=MAX_ALERTS):
         self._lock = threading.Lock()
@@ -66,21 +239,41 @@ class AlertStore:
 
     def add(self, record: logging.LogRecord):
         with self._lock:
+            message = record.getMessage()
             entry = {
                 "id": self._next_id,
                 "ts": record.created,
                 "time": time.strftime("%H:%M:%S", time.localtime(record.created)),
                 "severity": dd.severity_of(record),
-                "category": dd.categorize(record.getMessage()),
-                "message": record.getMessage(),
+                "category": dd.categorize(message),
+                "message": message,
             }
+            if is_hands_on_message(message):
+                # Distinct visual classification, separate from generic
+                # findings: the frontend renders the orange banner off
+                # these two fields, and snapshot() pins the row to the
+                # top of the queue. Kept as explicit fields (not guessed
+                # from the message text at render time) so the contract
+                # lives in one place - hands_on.py - not in JavaScript.
+                entry["hands_on"] = True
+                entry["classification"] = HANDS_ON_LABEL
             self._next_id += 1
             self._alerts.appendleft(entry)
 
     def snapshot(self, limit=None):
+        """Alerts newest-first, EXCEPT that HANDS-ON THREAT alerts are
+        pinned to the very top regardless of timestamp. The partition is
+        stable (both halves keep their newest-first order), so pinning
+        reorders classes, never timestamps. `limit` is applied AFTER
+        pinning: a hands-on alert is never truncated away by the page
+        size - it would defeat the whole point if the one alert that must
+        be seen was the one dropped."""
         with self._lock:
             items = list(self._alerts)
-        return items[:limit] if limit else items
+        pinned = [a for a in items if a.get("hands_on")]
+        rest = [a for a in items if not a.get("hands_on")]
+        ordered = pinned + rest
+        return ordered[:limit] if limit else ordered
 
 
 class AlertLogHandler(logging.Handler):
@@ -132,6 +325,7 @@ class Backend:
     """Owns the engine + detection surfaces, mirroring main.py's wiring."""
 
     def __init__(self):
+        self.session_start = time.time()
         self.alert_store = AlertStore()
         logging.getLogger().addHandler(AlertLogHandler(self.alert_store))
         logging.getLogger().setLevel(logging.INFO)
@@ -152,6 +346,12 @@ class Backend:
         self.engine.correlator = self.correlator
         self.sysmon_health = SensorHealth("sysmon")
         self.etw_health = SensorHealth("etw")
+        # Wire the Memory Ancestry Graph provider: when the engine captures
+        # a forensic snapshot at detection time it walks THIS tracker's
+        # parent/child map (the same one feeding the Process Explorer
+        # Lineage column) via this callback - same after-the-fact wiring
+        # pattern as engine.correlator above.
+        self.engine.ancestry_provider = self.process_tracker.get_ancestry
 
     def _on_raw_event(self, event_id, data):
         """Single fan-out point for HeuristicEngine.on_event - every raw
@@ -162,6 +362,15 @@ class Backend:
         self.process_activity.add(event_id, data)
         self.process_tracker.add(event_id, data)
 
+    def _pid_seen(self, pid):
+        """self_test.py's pid_seen_fn for this entrypoint - reuses
+        ProcessActivityStore (every ProcessCreate event, scored or not)
+        rather than a new observer, since it already records exactly this.
+        str() on both sides because a pid recorded from Sysmon's XML text
+        and one from ETW's decoded int field can differ in type for the
+        same real PID."""
+        return any(str(row.get("pid")) == str(pid) for row in self.process_activity.snapshot())
+
     def start(self):
         logging.info("[*] Starting Static Ingress Scanner...")
         StaticScanner(self.engine, BINARIES_PATH, rule_engine=self.rules).scan()
@@ -169,33 +378,69 @@ class Backend:
 
         logging.info("[*] Starting Behavioral Telemetry Monitors (Sysmon + ETW)...")
         self.correlator.start()
-        self._sysmon_handle = start_monitor(self.engine, on_heartbeat=self.sysmon_health.touch)
-        self._etw_handle = start_etw_monitor(self.engine, on_heartbeat=self.etw_health.touch, correlator=self.correlator)
-        threading.Thread(target=watchdog_loop, args=([self.sysmon_health, self.etw_health],), daemon=True).start()
+        self._sysmon_handle = start_monitor(self.engine, on_heartbeat=self.sysmon_health.touch,
+                                            on_drop=self.sysmon_health.record_drop)
+        self._etw_handle = start_etw_monitor(self.engine, on_heartbeat=self.etw_health.touch,
+                                             correlator=self.correlator, on_drop=self.etw_health.record_drop)
+        threading.Thread(
+            target=watchdog_loop,
+            args=([self.sysmon_health, self.etw_health],),
+            kwargs={"blind_state_fn": self._blind_state},
+            daemon=True,
+        ).start()
 
         threading.Thread(target=self._module_sweep_loop, daemon=True).start()
+
+        # Benign, periodic self-test (see self_test.py) - proves the
+        # telemetry pipeline actually delivers real events end-to-end, and
+        # (only here, since this is the entrypoint with an AlertStore) that
+        # the alert-generation pipeline is actually wired.
+        threading.Thread(
+            target=self_test_loop,
+            args=(self._pid_seen, self.alert_store),
+            kwargs={
+                "interval": self.config['self_test']['interval_seconds'],
+                "timeout": self.config['self_test']['timeout_seconds'],
+            },
+            daemon=True,
+        ).start()
+
+    def stop(self):
+        """Release the ETW session so the process can exit (see
+        etw_monitor.stop_etw_monitor). Every other thread here is a daemon;
+        pywintrace's consumer thread is the one that isn't. Idempotent."""
+        etw_session, self._etw_handle = self._etw_handle, None
+        stop_etw_monitor(etw_session)
 
     def _module_sweep_loop(self):
         while True:
             time.sleep(MODULE_SWEEP_INTERVAL_SECONDS)
             self.inspector.sweep()
 
-    def _sensor_label(self, handle, health):
-        """'unavailable' means the sensor never came up at startup (e.g.
-        EvtSubscribe/ETW trace failed) - permanent for this run. 'stale'/
-        'live' come from SensorHealth's heartbeat, computed fresh on every
-        call so a sensor dying mid-run (e.g. `sc stop sysmon64`) is
-        reflected here without needing sensor_status to be re-set anywhere."""
-        if not handle:
-            return "unavailable"
-        return "stale" if health.is_stale() else "live"
+    def _blind_state(self):
+        """Aggregate visibility state across both behavioral sensors (see
+        sensor_health.compute_blind_state) - computed fresh on every call,
+        same as the per-sensor labels below, so it reflects a sensor dying
+        (or recovering) mid-run with no state to re-set anywhere."""
+        return current_blind_state(
+            [(self._sysmon_handle, self.sysmon_health), (self._etw_handle, self.etw_health)],
+            self.engine.total_events_seen,
+        )
 
     def summary(self):
         alerts = self.alert_store.snapshot()
         last_event = self.engine.last_event_time
-        sysmon_label = self._sensor_label(self._sysmon_handle, self.sysmon_health)
-        etw_label = self._sensor_label(self._etw_handle, self.etw_health)
+        # 'unavailable' means the sensor never came up at startup (e.g.
+        # EvtSubscribe/ETW trace failed) - permanent for this run. 'stale'/
+        # 'live' come from SensorHealth's heartbeat, computed fresh on every
+        # call so a sensor dying mid-run (e.g. `sc stop sysmon64`) is
+        # reflected here without needing sensor_status to be re-set anywhere.
+        sysmon_label = sensor_label(self._sysmon_handle, self.sysmon_health)
+        etw_label = sensor_label(self._etw_handle, self.etw_health)
+        blind_state = self._blind_state()
         return {
+            "hostname": socket.gethostname(),
+            "session_start": self.session_start,
             "sensor_status": f"Sysmon: {sysmon_label} | ETW: {etw_label}",
             # Per-sensor liveness (see sensor_health.py) - observe-only, not
             # auto-restarted. A stale sensor doesn't mean detection stopped:
@@ -203,6 +448,30 @@ class Backend:
             # fallback dispatch) keeps working independently.
             "sysmon_stale": self.sysmon_health.is_stale(),
             "etw_stale": self.etw_health.is_stale(),
+            # Structured per-sensor state ("live"/"stale"/"unavailable") for
+            # the dashboard's sensor-health gauge - sensor_status above is
+            # the same information as one display string, kept for the
+            # existing badge rendering.
+            "sysmon_state": sysmon_label,
+            "etw_state": etw_label,
+            # Events a sensor observed but had to discard because its bounded
+            # queue was full (all time, this run) - the size of the visibility
+            # hole behind a "lossy" state.
+            "sysmon_dropped_events": self.sysmon_health.drops_total(),
+            "etw_dropped_events": self.etw_health.drops_total(),
+            # Aggregate visibility state (see sensor_health.compute_blind_state)
+            # - HEALTHY/DEGRADED/PARTIALLY_BLIND/CRITICALLY_BLIND, driven by
+            # telemetry integrity rather than just "is the process running".
+            "blind_state": blind_state,
+            # Negative-evidence protection (threat-model item #19): whether
+            # the alert counts below can actually be read as "no activity
+            # observed" (only true when blind_state is HEALTHY) versus
+            # "activity could not be observed" - and a human-readable reason
+            # why, for the dashboard to show directly next to those counts
+            # rather than making a viewer infer it from blind_state alone.
+            "negative_evidence_reliable": blind_state == BLIND_STATE_HEALTHY,
+            "visibility_caveat": negative_evidence_caveat(blind_state),
+            "thresholds": self.config['thresholds'],
             "total_alerts": len(alerts),
             "critical_count": sum(1 for a in alerts if a["severity"] == "CRITICAL"),
             "warning_count": sum(1 for a in alerts if a["severity"] == "WARNING"),
@@ -293,6 +562,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/rules":
             self._send_json(backend.rules.summary())
         else:
+            # Detection-forensics routes (see the *_RE regexes above). The
+            # helpers return (payload, status) so error shapes are tested
+            # without an HTTP server.
+            live = PID_LIVE_RE.match(path)
+            if live:
+                payload, status = api_process_live(live.group(1))
+                self._send_json(payload, status)
+                return
+            ancestry = PID_ANCESTRY_RE.match(path)
+            if ancestry:
+                payload, status = api_process_ancestry(backend, ancestry.group(1))
+                self._send_json(payload, status)
+                return
             self._send_json({"error": "not found"}, 404)
 
     def do_POST(self):
@@ -401,22 +683,27 @@ def main():
         logging.warning("Elevated instance never came up (declined, blocked, or failed) - continuing here without admin; Sysmon telemetry will be unavailable, static analysis and the module sweep still run.")
 
     backend = Backend()
-    backend.start()
-
-    DashboardHandler.backend = backend
     try:
-        server = DashboardServer((HOST, PORT), DashboardHandler)
-    except OSError as e:
-        logging.error(f"Could not bind {HOST}:{PORT} ({e}). A dashboard is probably already running under a different account/elevation level - close it first.")
-        return
+        backend.start()
 
-    logging.info(f"Dashboard live at {_dashboard_url()}")
-    webbrowser.open(_dashboard_url())
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        logging.info("Shutting down dashboard server...")
-        server.shutdown()
+        DashboardHandler.backend = backend
+        try:
+            server = DashboardServer((HOST, PORT), DashboardHandler)
+        except OSError as e:
+            logging.error(f"Could not bind {HOST}:{PORT} ({e}). A dashboard is probably already running under a different account/elevation level - close it first.")
+            return
+
+        logging.info(f"Dashboard live at {_dashboard_url()}")
+        webbrowser.open(_dashboard_url())
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            logging.info("Shutting down dashboard server...")
+            server.shutdown()
+    finally:
+        # Every way out of main() - Ctrl+C, a failed bind, an unexpected error -
+        # must release the ETW session or the process can't exit.
+        backend.stop()
 
 
 if __name__ == "__main__":

@@ -23,3 +23,10 @@ ransomware:
 # yet measured against real Sysmon-vs-ETW delivery lag on a live system.
 correlator:
   fuse_window_seconds: 2.0
+
+# How often self_test.py's benign process-visibility/alert-pipeline check
+# runs, and how long it waits for each check to succeed before failing
+# loudly.
+self_test:
+  interval_seconds: 300
+  timeout_seconds: 15

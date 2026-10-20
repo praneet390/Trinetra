@@ -1,0 +1,11 @@
+# Build output and dev-machine-specific signing material - regenerated
+# locally from source, never shared across machines.
+x64/
+Debug/
+Release/
+*.sys
+*.cer
+*.pfx
+*.pdb
+*.obj
+*.log

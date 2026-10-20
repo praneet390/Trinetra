@@ -50,6 +50,14 @@ def test_categorize_ignores_lifecycle_messages_even_with_keyword_collision():
     assert categorize("[TELEMETRY] PID 1 -> +35 ([RULE:custom_lolbin_from_appdata_roaming] LOLBin 'x' launched)") == "Execution"
 
 
+def test_categorize_telemetry_contradiction():
+    msg = ("[TELEMETRY_CONTRADICTION] PID 1234: independent sensors disagree on parent "
+           "process - ETW reports parent PID 1, Sysmon reports parent PID 999")
+    assert categorize(msg) == "Telemetry Contradiction"
+    record = logging.LogRecord("x", logging.WARNING, "", 0, msg, None, None)
+    assert severity_of(record) == "WARNING"
+
+
 def test_build_process_rows_sorts_and_labels():
     engine = HeuristicEngine()
     engine.process_scores = {111111: 90, 222222: 60, 333333: 10}
@@ -102,6 +110,7 @@ def test_category_counts_sorted_descending():
 if __name__ == "__main__":
     test_severity_of()
     test_categorize_first_match_wins()
+    test_categorize_telemetry_contradiction()
     test_categorize_ignores_lifecycle_messages_even_with_keyword_collision()
     test_build_process_rows_sorts_and_labels()
     test_build_static_rows_recovers_filename_and_verdict()

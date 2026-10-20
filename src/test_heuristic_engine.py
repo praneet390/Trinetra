@@ -63,6 +63,289 @@ def test_powershell_obfuscation():
     assert engine.process_scores[pid] == 45
 
 
+_POWERSHELL_IMAGE = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+_PWSH_IMAGE = r"C:\Program Files\PowerShell\7\pwsh.exe"
+
+# Real command lines from a live false-positive report: Claude Code's Git
+# Bash wrapper (whose text contains `grep -E`, lowercased to `grep -e`) and
+# the grep it spawned, plus other common tools that use a bare -e flag.
+_FALSE_POSITIVE_LINES = [
+    (r"C:\Program Files\Git\usr\bin\bash.exe",
+     r'"C:\Program Files\Git\bin\..\usr\bin\bash.exe" -c "source /c/x.sh 2>/dev/null || true && eval '
+     r"'cd \"/c/proj/src\" && python failure_lab.py 2>&1 | grep -E \"scenarios,\"' < /dev/null\""),
+    (r"C:\Program Files\Git\usr\bin\grep.exe", r'"C:\Program Files\Git\usr\bin\grep.exe" -E scenarios,'),
+    (r"C:\Program Files\Git\usr\bin\sed.exe", "sed -e s/a/b/ file.txt"),
+    (r"C:\Program Files\nodejs\node.exe", 'node -e "console.log(1)"'),
+    (r"C:\Windows\System32\notepad.exe", "notepad.exe DownloadString.txt"),
+]
+
+
+def _score_process_create(pid, image, command_line, **extra):
+    engine = HeuristicEngine()
+    engine._handle_process_create({'ProcessId': pid, 'Image': image, 'CommandLine': command_line, **extra})
+    return engine.process_scores.get(pid, 0)
+
+
+def test_powershell_abuse_ignores_non_powershell_processes():
+    # Regression: the bare '-e ' pattern used to score every process whose
+    # (lowercased) command line contained it, e.g. `grep -E`.
+    for image, command_line in _FALSE_POSITIVE_LINES:
+        assert _score_process_create(fresh_pid(), image, command_line) == 0, f"false positive: {command_line[:60]}"
+
+
+def test_powershell_abuse_flags_every_pattern_on_a_powershell_host():
+    # Scoping to PowerShell hosts must not silently drop any pattern.
+    for host in (_POWERSHELL_IMAGE, _PWSH_IMAGE):
+        for pattern in he.POWERSHELL_ABUSE_PATTERNS:
+            score = _score_process_create(fresh_pid(), host, f"powershell {pattern}x")
+            assert score == 45, f"{pattern!r} on {host} scored {score}"
+
+
+def test_powershell_abuse_host_match_is_case_insensitive():
+    score = _score_process_create(fresh_pid(), r"C:\WINDOWS\SYSTEM32\WINDOWSPOWERSHELL\V1.0\POWERSHELL.EXE",
+                                  "POWERSHELL -ENC AQBLAHGA")
+    assert score == 45
+
+
+def test_powershell_abuse_flags_a_renamed_host_via_original_file_name():
+    # Sysmon's OriginalFileName is the name in the PE header, so renaming
+    # powershell.exe to something else doesn't hide it from this rule.
+    for original in ("PowerShell.EXE", "pwsh.dll"):
+        score = _score_process_create(fresh_pid(), r"C:\ProgramData\svc.exe", "svc.exe -enc aQBlAHgA",
+                                      OriginalFileName=original)
+        assert score == 45, original
+
+
+def test_powershell_abuse_scores_the_powershell_child_not_a_cmd_wrapper():
+    # cmd.exe merely *quoting* a PowerShell command line is not itself the
+    # PowerShell host; the powershell.exe child gets its own event.
+    line = 'cmd.exe /c "powershell -enc aQBlAHgA"'
+    assert _score_process_create(fresh_pid(), r"C:\Windows\System32\cmd.exe", line) == 0
+    assert _score_process_create(fresh_pid(), _POWERSHELL_IMAGE, "powershell -enc aQBlAHgA") == 45
+
+
+_SYS32 = r"C:\Windows\System32"
+
+# Tools that merely CARRY tamper text in their command line (search, commit
+# message, print, open a file) - none of them executes a tamper command, and a
+# match here means mitigate() kills the tool.
+_TAMPER_TEXT_CARRIERS = [
+    r"C:\Program Files\Git\usr\bin\bash.exe", r"C:\Program Files\Git\usr\bin\grep.exe",
+    r"C:\Program Files\Git\cmd\git.exe", r"C:\Users\bob\.vscode\rg.exe",
+    r"C:\Python314\python.exe", r"C:\Program Files\nodejs\node.exe",
+    r"C:\Program Files\Microsoft VS Code\Code.exe", _SYS32 + r"\notepad.exe",
+    r"C:\Users\bob\.local\bin\claude.exe",
+    # launchers that only pass a command along: still caught via the
+    # interpreter/utility process they spawn, so not flagged themselves
+    _SYS32 + r"\wbem\wmic.exe", _SYS32 + r"\schtasks.exe", _SYS32 + r"\mshta.exe",
+]
+
+
+def _new_recording_engine():
+    engine = HeuristicEngine()
+    mitigated = []
+    engine.mitigate = mitigated.append
+    return engine, mitigated
+
+
+def _tamper_mitigation_count(engine, mitigated, image, command_line, **extra):
+    """How many times mitigate() was called (for this fresh PID) by one
+    ProcessCreate dispatch."""
+    pid = fresh_pid()
+    before = len(mitigated)
+    engine._handle_process_create({'ProcessId': pid, 'Image': image, 'CommandLine': command_line, **extra})
+    new_calls = mitigated[before:]
+    assert all(p == pid for p in new_calls), f"mitigate() called for the wrong pid: {new_calls}"
+    return len(new_calls)
+
+
+def test_defender_tamper_ignores_processes_that_merely_carry_the_text():
+    # Regression: the rule used to inspect every process, so any tool whose
+    # command line contained a tamper pattern (grep, git commit -m, python -c,
+    # an editor, a `bash -c` wrapper...) scored +90 and was mitigated.
+    engine, mitigated = _new_recording_engine()
+    for image in _TAMPER_TEXT_CARRIERS:
+        for pattern in he.DEFENDER_TAMPER_PATTERNS:
+            for line in (f'grep -rn "{pattern}" src/', f'git commit -m "about {pattern}"', pattern):
+                assert _tamper_mitigation_count(engine, mitigated, image, line) == 0, f"{image}: {line}"
+    assert mitigated == []
+
+
+def test_defender_tamper_flags_every_pattern_on_every_host():
+    # The host gate must not silently drop any pattern, nor any host, and it
+    # must work both by image name and by the PE header's OriginalFileName.
+    engine, mitigated = _new_recording_engine()
+    for host in he.DEFENDER_TAMPER_HOSTS:
+        for pattern in he.DEFENDER_TAMPER_PATTERNS:
+            by_image = _tamper_mitigation_count(engine, mitigated, f"{_SYS32}\\{host}", f"x {pattern} y")
+            assert by_image == 1, f"{pattern!r} on image {host} mitigated {by_image}x"
+            by_original = _tamper_mitigation_count(engine, mitigated, r"C:\ProgramData\renamed.exe",
+                                                   f"x {pattern} y", OriginalFileName=host)
+            assert by_original == 1, f"{pattern!r} with OriginalFileName {host} mitigated {by_original}x"
+
+
+def test_defender_tamper_matches_the_launchers_actual_spelling():
+    # Sysmon records the launcher's exact text. These are the same commands
+    # as the patterns, spelled the way PowerShell/cmd/CreateProcess emit them.
+    engine, mitigated = _new_recording_engine()
+    cases = [
+        (_SYS32 + r"\sc.exe", r'"C:\WINDOWS\system32\sc.exe" stop windefend'),
+        (_SYS32 + r"\sc.exe", r'"C:\WINDOWS\system32\sc.exe" config WinDefend start= disabled'),
+        (_SYS32 + r"\net.exe", r'"C:\WINDOWS\system32\net.exe" stop windefend'),
+        (_SYS32 + r"\net1.exe", r"C:\Windows\system32\net1 stop windefend"),
+        (_SYS32 + r"\taskkill.exe", r'"C:\WINDOWS\system32\taskkill.exe" /f /im MsMpEng.exe'),
+        (_SYS32 + r"\taskkill.exe", r'"C:\WINDOWS\system32\taskkill.exe" /im MsMpEng.exe /f'),
+        (_SYS32 + r"\sc.exe", "sc   stop \t windefend"),
+        (_SYS32 + r"\sc.exe", 'sc "stop" windefend'),
+        (_SYS32 + r"\cmd.exe", r'"C:\Windows\system32\cmd.exe" /c "net stop windefend"'),
+        (_POWERSHELL_IMAGE, 'powershell.exe -NoP -Command "Set-MpPreference   -DisableRealtimeMonitoring $true"'),
+        (_SYS32 + r"\reg.exe",
+         r'reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows Defender" /v DisableAntiSpyware /t REG_DWORD /d 1 /f'),
+    ]
+    for image, line in cases:
+        assert _tamper_mitigation_count(engine, mitigated, image, line) == 1, line
+
+
+def test_defender_tamper_host_match_is_case_insensitive_and_path_agnostic():
+    engine, mitigated = _new_recording_engine()
+    for image in (r"C:\WINDOWS\SYSTEM32\SC.EXE",
+                  r"\Device\HarddiskVolume3\Windows\System32\sc.exe",  # ETW-style NT path
+                  r"D:\anywhere\at\all\sc.exe"):
+        assert _tamper_mitigation_count(engine, mitigated, image, "SC STOP WINDEFEND") == 1, image
+
+
+def test_defender_tamper_original_file_name_only_widens_inspection():
+    # A binary can claim any OriginalFileName in its own version resource;
+    # claiming a host name only makes us LOOK at it, and a non-tamper command
+    # line still scores nothing.
+    engine, mitigated = _new_recording_engine()
+    assert _tamper_mitigation_count(engine, mitigated, r"C:\ProgramData\x.exe", "x.exe --version",
+                                    OriginalFileName="cmd.exe") == 0
+    # ...while a non-host original name never grants a pass or an inspection
+    assert _tamper_mitigation_count(engine, mitigated, _SYS32 + r"\notepad.exe", "sc stop windefend",
+                                    OriginalFileName="notepad.exe") == 0
+
+
+def test_defender_tamper_needs_a_command_line():
+    engine, mitigated = _new_recording_engine()
+    for host in ("cmd.exe", "sc.exe", "powershell.exe"):
+        pid = fresh_pid()
+        engine._handle_process_create({'ProcessId': pid, 'Image': f"{_SYS32}\\{host}", 'CommandLine': None})
+        engine._handle_process_create({'ProcessId': pid, 'Image': f"{_SYS32}\\{host}", 'CommandLine': ""})
+        engine._handle_process_create({'ProcessId': pid, 'Image': f"{_SYS32}\\{host}"})
+    assert mitigated == []
+
+
+def test_defender_tamper_normalization_never_changes_the_logged_command_line():
+    import logging
+
+    class _Capture(logging.Handler):
+        def __init__(self):
+            super().__init__(logging.INFO)
+            self.messages = []
+
+        def emit(self, record):
+            self.messages.append(record.getMessage())
+
+    engine, _ = _new_recording_engine()
+    root = logging.getLogger()
+    original_level = root.level
+    capture = _Capture()
+    root.addHandler(capture)
+    root.setLevel(logging.INFO)
+    line = r'"C:\WINDOWS\system32\sc.exe"   stop windefend'
+    try:
+        engine._handle_process_create({'ProcessId': fresh_pid(), 'Image': _SYS32 + r"\sc.exe", 'CommandLine': line})
+    finally:
+        root.removeHandler(capture)
+        root.setLevel(original_level)
+    finding = [m for m in capture.messages if "Attempted Defender tampering" in m]
+    assert len(finding) == 1
+    assert line.lower() in finding[0], "the alert must show the original, un-normalized command line"
+
+
+def test_normalize_command_line():
+    assert he._normalize_command_line('"a"  b\tc\n d') == "a b c d"
+    assert he._normalize_command_line("") == ""
+    assert he._normalize_command_line('""') == ""
+    assert he._normalize_command_line("no change here") == "no change here"
+    assert he._normalize_command_line("  padded  ") == "padded"
+
+
+def test_defender_tamper_still_respects_the_protected_floor():
+    # The two-layer safety floor must hold for the tamper rule too: the
+    # agent's own PID is never scored, so mitigate() is never reached.
+    engine, mitigated = _new_recording_engine()
+    pid = fresh_pid()
+    engine._own_pid = pid
+    engine._handle_process_create({'ProcessId': pid, 'Image': _SYS32 + r"\cmd.exe",
+                                   'CommandLine': "cmd.exe /c sc stop windefend"})
+    assert mitigated == [] and pid not in engine.process_scores
+
+
+def test_defender_tamper_is_deduplicated_across_provisional_and_fused_dispatches():
+    engine, mitigated = _new_recording_engine()
+    pid = fresh_pid()
+    key = (pid, 4242.0)
+    image = _SYS32 + r"\sc.exe"
+    engine._handle_process_create({'ProcessId': pid, 'Image': image, '_dedup_key': key})  # ETW provisional: no CommandLine
+    assert mitigated == []
+    fused = {'ProcessId': pid, 'Image': image, 'CommandLine': "sc stop windefend", '_dedup_key': key}
+    engine._handle_process_create(fused)
+    engine._handle_process_create(dict(fused))  # the same real event dispatched again
+    assert mitigated == [pid], "one real event must mitigate exactly once"
+
+
+def test_defender_tamper_and_powershell_abuse_both_evaluate_on_a_powershell_host():
+    # +90 mitigates and resets the score to 0; the PowerShell rule then adds
+    # its own +45 on top - unchanged behavior, pinned here.
+    engine, mitigated = _new_recording_engine()
+    pid = fresh_pid()
+    engine._handle_process_create({'ProcessId': pid, 'Image': _POWERSHELL_IMAGE,
+                                   'CommandLine': 'powershell -enc AQBl -c "Set-MpPreference -DisableRealtimeMonitoring 1"'})
+    assert mitigated == [pid]
+    assert abs(engine.process_scores[pid] - 45) < 0.01
+
+
+def test_defender_tamper_wrapper_is_not_flagged_but_its_spawned_child_is():
+    engine, mitigated = _new_recording_engine()
+    wrapper = 'wmic process call create "powershell -c Set-MpPreference -DisableRealtimeMonitoring 1"'
+    assert _tamper_mitigation_count(engine, mitigated, _SYS32 + r"\wbem\wmic.exe", wrapper) == 0
+    assert _tamper_mitigation_count(engine, mitigated, _POWERSHELL_IMAGE,
+                                    "powershell -c Set-MpPreference -DisableRealtimeMonitoring 1") == 1
+
+
+def test_defender_tamper_tests_can_actually_fail():
+    # Mutation guard: if the host gate or the normalization is removed, the
+    # tests above must notice - otherwise they prove nothing.
+    class _Everything:
+        def __contains__(self, item):
+            return True
+
+    original_hosts, original_normalize = he.DEFENDER_TAMPER_HOSTS, he._normalize_command_line
+    try:
+        he.DEFENDER_TAMPER_HOSTS = _Everything()  # old behavior: inspect every process
+        try:
+            test_defender_tamper_ignores_processes_that_merely_carry_the_text()
+            raised = False
+        except AssertionError:
+            raised = True
+        assert raised, "removing the host gate must make the false-positive test fail"
+    finally:
+        he.DEFENDER_TAMPER_HOSTS = original_hosts
+
+    try:
+        he._normalize_command_line = lambda s: s  # old behavior: raw substring match
+        try:
+            test_defender_tamper_matches_the_launchers_actual_spelling()
+            raised = False
+        except AssertionError:
+            raised = True
+        assert raised, "removing the normalization must make the spelling test fail"
+    finally:
+        he._normalize_command_line = original_normalize
+
+
 def test_office_macro_dropper_chain():
     engine = HeuristicEngine()
     pid = fresh_pid()
@@ -459,13 +742,196 @@ def test_handle_process_create_dedup_end_to_end():
     engine = HeuristicEngine()
     pid = fresh_pid()
     dedup_key = (pid, 999.9)
-    provisional = {'ProcessId': pid, 'Image': r'C:\Users\bob\AppData\Local\Temp\evil.exe', '_dedup_key': dedup_key}
-    fused = {'ProcessId': pid, 'Image': r'C:\Users\bob\AppData\Local\Temp\evil.exe',
+    # A PowerShell host running from a staging dir: staging_dir needs the
+    # path, powershell_abuse needs a PowerShell image (see POWERSHELL_HOSTS).
+    image = r'C:\Users\bob\AppData\Local\Temp\powershell.exe'
+    provisional = {'ProcessId': pid, 'Image': image, '_dedup_key': dedup_key}
+    fused = {'ProcessId': pid, 'Image': image,
              'CommandLine': 'powershell -enc aGVsbG8=', '_dedup_key': dedup_key}
     engine._handle_process_create(provisional)
     engine._handle_process_create(fused)
     # staging_dir (30) once + powershell_abuse (45) once = 75, NOT 30+30+45
     assert abs(engine.process_scores[pid] - 75) < 0.01
+
+
+# ---- Alert-time evidence: activity anchor lifecycle ------------------------
+
+def test_activity_anchor_cleared_on_pid_reuse():
+    engine = HeuristicEngine()
+    pid = fresh_pid()
+    engine._add_score(pid, 30, 'staging dir', check_id='staging_dir')
+    # Simulate the OS handing this PID to a different process.
+    real_create = psutil.Process
+    class _NewProc:
+        @staticmethod
+        def create_time():
+            return 1.5
+    psutil.Process = lambda p: _NewProc()
+    try:
+        engine._pid_start_times[pid] = 0.0  # different start time -> reuse
+        engine._reset_score_if_pid_reused(pid)
+        assert pid not in engine.score_first_seen
+    finally:
+        psutil.Process = real_create
+
+
+def test_activity_anchor_cleared_after_mitigation_snapshot_survives():
+    engine = HeuristicEngine()
+    pid = fresh_pid()
+    engine._add_score(pid, 90, 'Defender tampering', check_id='defender_tamper')
+    # +90 crossed critical: snapshot taken, mitigation no-ops on the fake
+    # PID, live state cleared, forensic evidence retained.
+    assert pid in engine.forensic_snapshots
+    snapshot = engine.forensic_snapshots[pid]
+    assert snapshot['trigger'] == 'critical_threshold'
+    assert snapshot['score_at_capture'] == 90
+    assert pid not in engine.score_first_seen
+
+
+# ---- Memory Ancestry Graph: detection-time forensic snapshots --------------
+
+def _fake_ancestry(pid):
+    return {
+        'pid': pid,
+        'nodes': [
+            {'pid': 1, 'ppid': None, 'image': r'C:\Windows\explorer.exe', 'command_line': None,
+             'user': None, 'spawn_time': None, 'first_seen': 1.0, 'alive': True,
+             'env_vars': None, 'env_note': None},
+            {'pid': pid, 'ppid': 1, 'image': r'C:\Temp\evil.exe', 'command_line': 'evil.exe',
+             'user': 'bob', 'spawn_time': None, 'first_seen': 2.0, 'alive': True,
+             'env_vars': {'PATH': 'x'}, 'env_note': None},
+        ],
+        'edges': [{'from': 1, 'to': pid, 'label': 'EXEC'}],
+        'incomplete': False,
+    }
+
+
+def test_forensic_snapshot_captured_at_warning_threshold():
+    engine = HeuristicEngine(config={'thresholds': {'warning': 25, 'critical': 80},
+                                     'decay_points_per_second': 0.0,
+                                     'ransomware': {'file_event_window_seconds': 20, 'file_event_threshold': 60},
+                                     'correlator': {'fuse_window_seconds': 2.0},
+                                     'self_test': {'interval_seconds': 300, 'timeout_seconds': 15}})
+    engine.ancestry_provider = _fake_ancestry
+    pid = fresh_pid()
+    engine._add_score(pid, 30, 'staging dir exec', check_id='staging_dir')
+    snapshot = engine.forensic_snapshots[pid]
+    assert snapshot['trigger'] == 'warning_threshold'
+    assert snapshot['ancestry']['nodes'][0]['image'] == r'C:\Windows\explorer.exe'
+    assert snapshot['chain_summary'] == 'explorer.exe -> evil.exe'
+    assert snapshot['ancestry_note'] is None
+    assert snapshot['activity_span_seconds'] is not None
+
+
+def test_forensic_snapshot_first_wins_not_overwritten_on_escalation():
+    engine = HeuristicEngine()
+    engine.ancestry_provider = _fake_ancestry
+    pid = fresh_pid()
+    # 30 (below warning) + 30 again (same check, fresh dispatch) crosses
+    # the warning tier -> first snapshot; then +90 crosses critical.
+    engine._add_score(pid, 30, 'staging dir exec', check_id='staging_dir_a')
+    engine._add_score(pid, 30, 'staging dir exec 2', check_id='staging_dir_b')   # warning @ 60
+    engine._add_score(pid, 90, 'Defender tampering', check_id='defender_tamper')  # critical @ 150
+    # The escalation must NOT have replaced the evidence: one snapshot per
+    # PID, the first capture wins.
+    assert engine.forensic_snapshots[pid]['trigger'] == 'warning_threshold'
+    assert engine.forensic_snapshots[pid]['score_at_capture'] == 60
+
+
+def test_mitigate_captures_snapshot_when_none_exists():
+    engine = HeuristicEngine()
+    engine.ancestry_provider = _fake_ancestry
+    pid = fresh_pid()
+    engine.mitigate(pid)  # direct dashboard-style request, no prior score
+    assert engine.forensic_snapshots[pid]['trigger'] == 'mitigation_requested'
+
+
+def test_forensic_snapshot_without_provider_degrades_honestly():
+    engine = HeuristicEngine()
+    pid = fresh_pid()
+    engine._add_score(pid, 90, 'tamper', check_id='defender_tamper')
+    snapshot = engine.forensic_snapshots[pid]
+    assert snapshot['ancestry'] is None
+    assert 'no lineage tracker' in snapshot['ancestry_note']
+
+
+def test_forensic_snapshot_provider_failure_degrades_not_raises():
+    engine = HeuristicEngine()
+    def _boom(pid):
+        raise RuntimeError('tracker exploded')
+    engine.ancestry_provider = _boom
+    pid = fresh_pid()
+    engine._add_score(pid, 90, 'tamper', check_id='defender_tamper')  # must not raise
+    snapshot = engine.forensic_snapshots[pid]
+    assert snapshot['ancestry'] is None
+    assert 'failed' in snapshot['ancestry_note']
+
+
+def test_process_access_edge_labels_the_snapshot():
+    # The Windows analog of the MMAP(RWX) edge: an untrusted process
+    # opening LSASS with dangerous rights records an access edge, and the
+    # actor's forensic snapshot carries it as trigger_edge - with BOTH the
+    # raw OpenProcess(mask) observation label and the syscall-family label
+    # the mask implies (VM_WRITE present -> MMAP(RWX)).
+    engine = HeuristicEngine()
+    engine.ancestry_provider = _fake_ancestry
+    actor = fresh_pid()
+    engine._handle_process_access({
+        'SourceProcessId': actor, 'SourceImage': r'C:\Temp\mimikatz.exe',
+        'TargetProcessId': 700, 'TargetImage': 'c:\\windows\\system32\\lsass.exe',
+        'GrantedAccess': '0x143A',
+    })
+    assert actor in engine.forensic_snapshots  # +70 crosses warning(50)
+    edge = engine.forensic_snapshots[actor]['trigger_edge']
+    # The handler lowercases GrantedAccess with the rest of the event
+    # fields (same normalization every rule matches against), so the edge
+    # label carries the lowercased mask - identical text to what the
+    # finding's context string shows the analyst.
+    assert edge['label'] == 'OpenProcess(0x143a)'
+    assert edge['syscall'] == 'MMAP(RWX)'
+    assert edge['to'] == 700
+    # The access edge must ALSO be merged into the ancestry's edge list
+    # (kind='access') so the reconstructed attack chain is one graph:
+    # birth edges (EXEC) plus the injection edge.
+    ancestry_edges = engine.forensic_snapshots[actor]['ancestry']['edges']
+    access_edges = [e for e in ancestry_edges if e.get('kind') == 'access']
+    assert len(access_edges) == 1
+    assert access_edges[0]['syscall'] == 'MMAP(RWX)'
+    assert access_edges[0]['to'] == 700
+
+
+def test_access_edge_syscall_label_follows_the_rights_mask():
+    # The syscall vocabulary on access edges, derived from the granted
+    # rights: VM_WRITE or ALL_ACCESS -> MMAP(RWX) (can map/write executable
+    # memory into the victim); CREATE_THREAD without write -> CREATETHREAD
+    # (remote-thread primitive); anything else stays an honest raw
+    # OpenProcess(mask) with no injection claim.
+    engine = HeuristicEngine()
+    cases = [
+        ('0x0020', 'MMAP(RWX)'),      # PROCESS_VM_WRITE alone
+        ('0x143A', 'MMAP(RWX)'),      # dump/inject combo carrying VM_WRITE
+        ('0x1FFFFF', 'MMAP(RWX)'),    # PROCESS_ALL_ACCESS
+        ('0x0002', 'CREATETHREAD'),   # CREATE_THREAD only
+        ('0x0010', 'OpenProcess(0x0010)'),  # VM_READ only - reads, not writes
+    ]
+    actor = fresh_pid()
+    for i, (mask, expected) in enumerate(cases):
+        engine._record_access_edge(actor, 900 + i, f'target{i}.exe', mask)
+        edge = engine._access_edge_for(actor)
+        assert edge['syscall'] == expected, f"mask {mask} must label as {expected}"
+
+
+def test_snapshot_without_access_edge_has_no_connection_note():
+    # A chain-only detection (no process-access event ever seen for this
+    # PID) must not invent a connection edge - the ancestry is births only,
+    # all labeled EXEC, and the forensic log line carries no edge note.
+    engine = HeuristicEngine()
+    engine.ancestry_provider = _fake_ancestry
+    pid = fresh_pid()
+    engine._add_score(pid, 90, 'Defender tampering', check_id='defender_tamper')
+    snapshot = engine.forensic_snapshots[pid]
+    assert snapshot['trigger_edge'] is None
+    assert all(e['label'] == 'EXEC' for e in snapshot['ancestry']['edges'])
 
 
 if __name__ == "__main__":

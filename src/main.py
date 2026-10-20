@@ -3,13 +3,15 @@ import time
 import logging
 from static_scanner import StaticScanner
 from telemetry_monitor import start_monitor
-from etw_monitor import start_etw_monitor
+from etw_monitor import start_etw_monitor, stop_etw_monitor
 from heuristic_engine import HeuristicEngine
 from module_inspector import ModuleInspector
 from process_correlator import ProcessCorrelator
 from rule_engine import RuleEngine
-from sensor_health import SensorHealth, watchdog_loop
+from sensor_health import SensorHealth, watchdog_loop, current_blind_state
 from detection_config import load_config
+from self_test import RecentPidSightings, self_test_loop
+from process_tracker import ProcessTracker
 
 MODULE_SWEEP_INTERVAL_SECONDS = 30
 
@@ -56,14 +58,65 @@ def main():
 
     sysmon_health = SensorHealth("sysmon")
     etw_health = SensorHealth("etw")
-    sub_handle = start_monitor(engine, on_heartbeat=sysmon_health.touch)
-    etw_handle = start_etw_monitor(engine, on_heartbeat=etw_health.touch, correlator=correlator)
-    threading.Thread(target=watchdog_loop, args=([sysmon_health, etw_health],), daemon=True).start()
+    sub_handle = start_monitor(engine, on_heartbeat=sysmon_health.touch, on_drop=sysmon_health.record_drop)
+    etw_handle = start_etw_monitor(engine, on_heartbeat=etw_health.touch, correlator=correlator,
+                                   on_drop=etw_health.record_drop)
+
+    def _blind_state():
+        # No dashboard is polling this CLI entrypoint, so the watchdog is
+        # the only thing that will ever observe a CRITICALLY_BLIND session
+        # here - hence logging transitions loudly (see watchdog_loop)
+        # rather than only exposing a value for something else to read.
+        return current_blind_state(
+            [(sub_handle, sysmon_health), (etw_handle, etw_health)],
+            engine.total_events_seen,
+        )
+
+    threading.Thread(
+        target=watchdog_loop,
+        args=([sysmon_health, etw_health],),
+        kwargs={"blind_state_fn": _blind_state},
+        daemon=True,
+    ).start()
 
     if not sub_handle:
         logging.warning("[-] Sysmon telemetry monitor failed to start. Continuing with reduced telemetry.")
     if not etw_handle:
         logging.warning("[-] ETW telemetry monitor failed to start. Continuing with reduced telemetry.")
+
+    # Benign, periodic self-test (see self_test.py) - proves telemetry
+    # actually delivers real events end-to-end, not just that the sensor
+    # threads above are alive. Nothing else in this headless entrypoint
+    # uses HeuristicEngine.on_event, so it's free to claim exclusively here.
+    sightings = RecentPidSightings()
+    # Process ancestry tracker (see process_tracker.py) - the same class the
+    # dashboard wires, so the headless entrypoint builds identical forensic
+    # ancestry snapshots when a detection crosses a threshold. engine.on_event
+    # supports exactly ONE observer, so both consumers (self-test sightings
+    # and the tracker) hang off this small fan-out - the same shape
+    # web_server.py's _on_raw_event uses, kept inline here because the
+    # headless entrypoint has no Backend to own it.
+    tracker = ProcessTracker()
+
+    def _observe_raw_event(event_id, data):
+        sightings.observe(event_id, data)
+        tracker.add(event_id, data)
+
+    engine.on_event = _observe_raw_event
+    # Forensic snapshots at detection time now walk the tracker's parent/
+    # child map (see heuristic_engine._capture_forensic_snapshot) - same
+    # wiring web_server.py performs, so both entrypoints produce identical
+    # Memory Ancestry Graph evidence.
+    engine.ancestry_provider = tracker.get_ancestry
+    threading.Thread(
+        target=self_test_loop,
+        args=(sightings.seen,),
+        kwargs={
+            "interval": config['self_test']['interval_seconds'],
+            "timeout": config['self_test']['timeout_seconds'],
+        },
+        daemon=True,
+    ).start()
 
     # 4. Active Module Provenance Sweeper (System Informer-style)
     # Complements the passive Sysmon subscription above by periodically
@@ -84,6 +137,10 @@ def main():
                 inspector.sweep()
     except KeyboardInterrupt:
         logging.info("\n[*] Shutting down Defensive Agent...")
+    finally:
+        # pywintrace's consumer thread is not a daemon; unless it is stopped the
+        # process can't exit (see etw_monitor.stop_etw_monitor).
+        stop_etw_monitor(etw_handle)
 
 if __name__ == "__main__":
     main()

@@ -1,14 +1,18 @@
 :root {
-  --bg: #14161a;
-  --panel: #1c1f26;
-  --panel-2: #22262e;
-  --border: #2b2f38;
-  --fg: #e6e6e6;
-  --muted: #9aa0a6;
-  --accent: #3aa0ff;
-  --critical: #ff4d4d;
-  --warning: #ffb020;
-  --info: #6c7280;
+  --bg: #071019;
+  --panel: #0c1720;
+  --panel-2: #101f2b;
+  --border: #1c313d;
+  --fg: #d6e4ea;
+  --fg-strong: #eef7fa;
+  --muted: #6f8a97;
+  --accent: #2dd4c8;
+  --accent-glow: rgba(45,212,200,0.35);
+  --critical: #e0574a;
+  --warning: #e0a83f;
+  --ok: #35b37e;
+  --info: #5c6570;
+  --mono: "Cascadia Mono", "Consolas", "SFMono-Regular", Menlo, monospace;
 }
 
 * { box-sizing: border-box; }
@@ -17,126 +21,220 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--fg);
-  font-family: "Segoe UI", system-ui, sans-serif;
-  font-size: 14px;
+  font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  font-size: 13px;
 }
+
+/* ---- masthead ------------------------------------------------------- */
+.masthead {
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+.masthead-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 10px 24px 4px;
+}
+.brand { font-size: 16px; font-weight: 600; color: var(--fg-strong); letter-spacing: 0.01em; }
+.brand .brand-sub { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 6px; }
+.masthead-meta {
+  display: flex;
+  gap: 18px;
+  padding: 0 24px 10px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+.masthead-meta span b { color: var(--fg); font-weight: 600; }
 
 .topbar {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 12px 24px;
-  background: var(--panel);
-  border-bottom: 1px solid var(--border);
+  padding: 8px 24px;
 }
-
-.brand { font-size: 18px; font-weight: 600; }
-.brand span { color: var(--accent); font-weight: 400; }
-
-.topbar-right { display: flex; align-items: center; gap: 12px; }
+.topbar-right { display: flex; align-items: center; gap: 10px; }
 
 .badge {
-  padding: 4px 10px;
-  border-radius: 12px;
-  font-size: 12px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  font-size: 11px;
+  font-family: var(--mono);
+  letter-spacing: 0.02em;
 }
-.badge-neutral { background: #2b2f38; color: var(--muted); }
-.badge-ok { background: rgba(58,160,255,0.15); color: var(--accent); }
-.badge-off { background: rgba(255,77,77,0.15); color: var(--critical); }
-.badge-warn { background: rgba(255,176,32,0.15); color: var(--warning); }
+.badge-neutral { color: var(--muted); }
+.badge-ok { border-color: rgba(45,212,200,0.5); color: var(--accent); }
+.badge-off { border-color: rgba(224,87,74,0.5); color: var(--critical); background: rgba(224,87,74,0.08); }
+.badge-warn { border-color: rgba(224,168,63,0.5); color: var(--warning); background: rgba(224,168,63,0.08); }
 
 .btn {
-  border-radius: 6px;
-  padding: 6px 14px;
+  border-radius: 2px;
+  padding: 5px 12px;
   border: 1px solid var(--border);
   background: var(--panel-2);
   color: var(--fg);
   cursor: pointer;
-  font-size: 13px;
+  font-size: 12px;
 }
-.btn:hover { background: #2a2f38; }
-.btn-danger-outline { border-color: var(--critical); color: var(--critical); background: transparent; }
-.btn-danger-outline:hover { background: rgba(255,77,77,0.1); }
-.btn-small { padding: 3px 10px; font-size: 12px; }
+.btn:hover { background: #16232d; border-color: #2a4451; }
+.btn-danger-outline { border-color: var(--critical); color: #ef8b80; background: transparent; }
+.btn-danger-outline:hover { background: rgba(224,87,74,0.12); }
+.btn-small { padding: 2px 8px; font-size: 11px; }
 
-main { padding: 20px 24px; max-width: 1400px; margin: 0 auto; }
+main { padding: 18px 24px 32px; max-width: 1440px; margin: 0 auto; }
+
+/* ---- gauges ---------------------------------------------------------
+   The only glow in this theme lives here, deliberately - two real,
+   computed values (sensor liveness, current peak threat score), not
+   decoration on every panel. */
+.gauge-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  margin-bottom: 16px;
+  background: var(--border);
+  border: 1px solid var(--border);
+}
+.gauge-card {
+  background: var(--panel);
+  padding: 16px 20px;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+}
+.gauge-card svg { flex: 0 0 auto; filter: drop-shadow(0 0 5px var(--accent-glow)); }
+.gauge-card.zone-warning svg { filter: drop-shadow(0 0 5px rgba(224,168,63,0.35)); }
+.gauge-card.zone-critical svg { filter: drop-shadow(0 0 5px rgba(224,87,74,0.35)); }
+.gauge-ring-bg { stroke: var(--border); fill: none; }
+.gauge-ring-value { stroke: var(--accent); fill: none; stroke-linecap: round; transition: stroke-dashoffset 0.4s ease; }
+.gauge-card.zone-warning .gauge-ring-value { stroke: var(--warning); }
+.gauge-card.zone-critical .gauge-ring-value { stroke: var(--critical); }
+.gauge-text {
+  font-family: var(--mono);
+  font-size: 20px;
+  font-weight: 600;
+  fill: var(--fg-strong);
+}
+.gauge-body { display: flex; flex-direction: column; gap: 2px; }
+.gauge-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+.gauge-sublabel { color: var(--muted); font-size: 11px; font-family: var(--mono); }
+
+.caveat-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  margin-bottom: 16px;
+  background: rgba(224,168,63,0.08);
+  border: 1px solid rgba(224,168,63,0.5);
+  border-radius: 2px;
+  color: var(--warning);
+  font-size: 12px;
+}
+.caveat-banner .caveat-icon { font-size: 14px; }
 
 .stat-grid {
   display: grid;
   grid-template-columns: repeat(6, 1fr);
-  gap: 14px;
-  margin-bottom: 18px;
+  gap: 1px;
+  margin-bottom: 16px;
+  background: var(--border);
+  border: 1px solid var(--border);
 }
-.stat-sublabel { display: block; margin-top: 2px; font-size: 11px; }
+.stat-sublabel { display: inline-block; margin-left: 6px; font-size: 10px; font-family: var(--mono); }
 .live-dot {
   display: inline-block;
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  margin-right: 8px;
+  width: 7px;
+  height: 7px;
+  margin-right: 7px;
   background: var(--info);
+  border-radius: 50%;
 }
-.live-dot.live { background: #2ecc71; box-shadow: 0 0 6px #2ecc71; }
+.live-dot.live { background: var(--ok); box-shadow: 0 0 4px var(--ok); }
 .live-dot.stale { background: var(--warning); }
 .stat-card {
   background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 16px;
+  padding: 14px 16px;
+  border-top: 2px solid transparent;
 }
-.stat-card.critical { border-color: rgba(255,77,77,0.4); }
-.stat-card.warning { border-color: rgba(255,176,32,0.4); }
-.stat-value { font-size: 28px; font-weight: 700; }
-.stat-card.critical .stat-value { color: var(--critical); }
-.stat-card.warning .stat-value { color: var(--warning); }
-.stat-label { color: var(--muted); font-size: 12px; margin-top: 4px; }
+.stat-card.critical { border-top-color: var(--critical); }
+.stat-card.warning { border-top-color: var(--warning); }
+.stat-value { font-size: 24px; font-weight: 600; font-family: var(--mono); color: var(--fg-strong); }
+.stat-card.critical .stat-value { color: #ef8b80; }
+.stat-card.warning .stat-value { color: #eec27f; }
+.stat-label { color: var(--muted); font-size: 11px; margin-top: 5px; text-transform: uppercase; letter-spacing: 0.04em; }
 
 .chart-grid {
   display: grid;
   grid-template-columns: 2fr 1fr 1fr;
-  gap: 14px;
-  margin-bottom: 18px;
+  gap: 1px;
+  margin-bottom: 16px;
+  background: var(--border);
+  border: 1px solid var(--border);
 }
 .panel {
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 16px;
 }
-.chart-panel h3 { margin: 0 0 10px 0; font-size: 13px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; }
+.chart-panel { padding: 14px 16px 8px; }
+.chart-panel h3 { margin: 0 0 12px 0; font-size: 11px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
 
-.tabs { display: flex; gap: 6px; margin-bottom: 14px; border-bottom: 1px solid var(--border); }
+.tabs { display: flex; gap: 2px; margin-bottom: 0; border-bottom: 1px solid var(--border); background: var(--panel-2); }
 .tab-btn {
   background: transparent;
   border: none;
   color: var(--muted);
-  padding: 8px 16px;
+  padding: 9px 18px;
   cursor: pointer;
-  font-size: 13px;
+  font-size: 12px;
   border-bottom: 2px solid transparent;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
 }
-.tab-btn.active { color: var(--fg); border-bottom-color: var(--accent); }
-.tab-content { display: none; }
+.tab-btn:hover { color: var(--fg); }
+.tab-btn.active { color: var(--fg-strong); border-bottom-color: var(--accent); background: var(--panel); }
+.tab-content { display: none; padding: 14px 16px 16px; }
 .tab-content.active { display: block; }
 
-.table-toolbar { display: flex; gap: 10px; margin-bottom: 10px; }
+.table-toolbar { display: flex; gap: 8px; margin-bottom: 10px; }
 .table-toolbar input, .table-toolbar select {
-  background: var(--panel-2);
+  background: var(--bg);
   border: 1px solid var(--border);
   color: var(--fg);
-  padding: 6px 10px;
-  border-radius: 6px;
-  font-size: 13px;
+  padding: 5px 9px;
+  border-radius: 2px;
+  font-size: 12px;
 }
-.table-toolbar input { flex: 1; }
+.table-toolbar input { flex: 1; font-family: var(--mono); }
 
-table { width: 100%; border-collapse: collapse; }
-th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 13px; }
-th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; }
+/* Wide content (long command lines, base64 blobs) wraps inside its cell
+   (overflow-wrap: anywhere below breaks even an unbroken token rather than
+   stretching the column) - .table-wrap is a scroll-inside-itself safety net
+   for anything that still doesn't fit, so the page body never has to. */
+.table-wrap { overflow-x: auto; }
+/* table-layout: fixed makes each table honor its own <colgroup> widths
+   (set per-table in index.html) instead of auto-sizing columns by content -
+   without this, one wide column (Command Line, Message, SHA-256) starves
+   every other column down to a sliver, wrapping short labels like "PID" or
+   "Source" one character per line. */
+table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+th, td {
+  text-align: left;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  font-family: var(--mono);
+  overflow-wrap: anywhere;
+  vertical-align: top;
+}
+th { color: var(--muted); font-weight: 600; font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; background: var(--panel-2); }
 tbody tr:hover { background: var(--panel-2); }
 
-.sev-CRITICAL { color: var(--critical); font-weight: 600; }
-.sev-WARNING { color: var(--warning); font-weight: 600; }
+.sev-CRITICAL { color: #ef8b80; font-weight: 600; }
+.sev-WARNING { color: #eec27f; font-weight: 600; }
 
 /* Process Explorer source column - which sensor(s) produced this row. See
    process_correlator.py: 'etw' is provisional (thin fields, arrived first),
@@ -147,5 +245,105 @@ tbody tr:hover { background: var(--panel-2); }
 .src-sysmon { color: var(--muted); }
 .sev-INFO { color: var(--info); }
 
-.empty-row td { color: var(--muted); text-align: center; padding: 20px; }
-.tab-note { color: var(--muted); font-size: 12px; margin: 0 0 12px 0; }
+.empty-row td { color: var(--muted); text-align: center; padding: 22px; font-family: "Segoe UI", sans-serif; }
+.tab-note { color: var(--muted); font-size: 11px; margin: 0 0 12px 0; font-family: "Segoe UI", sans-serif; }
+
+.footer-note {
+  max-width: 1440px;
+  margin: 18px auto 0;
+  padding: 12px 24px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+/* ---- detection-forensics modal (Live / Chain) ----------------------------
+   One shared modal shell; opened by the per-row buttons in the Endpoint
+   Processes table. Backdrop dims the page; the panel itself is a floating
+   card on the same dark palette as the rest of the dashboard. */
+.modal-backdrop {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(4, 10, 16, 0.72);
+  z-index: 100;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 48px 16px;
+  overflow-y: auto;
+}
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  width: 100%;
+  max-width: 760px;
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.55);
+}
+.modal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.modal-head h3 { margin: 0; font-size: 14px; color: var(--fg-strong); }
+.modal-body { padding: 14px 18px 18px; }
+.modal-note { color: var(--muted); font-size: 11.5px; margin: 6px 0; line-height: 1.5; }
+.modal-h4 { margin: 14px 0 6px; font-size: 12px; color: var(--fg-strong); text-transform: uppercase; letter-spacing: 0.04em; }
+
+.kv-row { display: flex; gap: 10px; padding: 3px 0; font-size: 12px; }
+.kv-label { color: var(--muted); min-width: 180px; flex-shrink: 0; }
+.kv-value { color: var(--fg); font-family: var(--mono); word-break: break-all; }
+
+/* Live Process Status + Memory Ancestry snapshot box (shared card shape). */
+.live-head, .snap-box {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 10px;
+  background: var(--panel-2);
+}
+.live-head { display: flex; flex-wrap: wrap; gap: 4px 22px; align-items: center; }
+
+/* HANDS-ON THREAT: the orange banner classification for Cobalt Strike
+   stager detections (see hands_on.py / web_server.AlertStore). Pinned to
+   the top of the Detections queue server-side; these styles make the row
+   impossible to mistake for a generic finding - orange left rail + tinted
+   background on the row, and a filled orange chip ahead of the message. */
+tr.hands-on-row td { background: rgba(184, 92, 11, 0.18); }
+tr.hands-on-row td:first-child { box-shadow: inset 3px 0 0 #c26a10; }
+.hands-on-chip {
+  display: inline-block;
+  background: #c26a10;
+  color: #fff4e8;
+  font-weight: 700;
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  padding: 2px 8px;
+  border-radius: 4px;
+  margin-right: 6px;
+  vertical-align: 1px;
+}
+
+/* Live Process Status lists (open files, connections, env excerpts). */
+.live-list { margin: 4px 0 8px; padding-left: 20px; color: var(--fg); font-size: 12px; line-height: 1.6; }
+.live-list.mono { font-family: var(--mono); font-size: 11.5px; word-break: break-all; }
+.env-list { max-height: 180px; overflow-y: auto; }
+
+/* Memory Ancestry chain: nodes indented per generation, edge label inline
+   before each child (—[EXEC]→ evil.exe). */
+.chain-tree { margin-top: 10px; }
+.chain-node {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin: 8px 0;
+  background: var(--panel-2);
+}
+.chain-title { display: flex; flex-wrap: wrap; gap: 10px; align-items: baseline; }
+.chain-image { color: var(--fg-strong); font-family: var(--mono); font-weight: 600; font-size: 12.5px; word-break: break-all; }
+.chain-pid { color: var(--muted); font-family: var(--mono); font-size: 11px; white-space: nowrap; }
+.chain-details { margin-top: 6px; }

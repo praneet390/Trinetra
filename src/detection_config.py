@@ -35,6 +35,16 @@ DEFAULTS = {
         # Sysmon-vs-ETW delivery lag on a live system (see README).
         'fuse_window_seconds': 2.0,
     },
+    'self_test': {
+        # How often self_test.py's benign process-visibility/alert-pipeline
+        # check runs. Deliberately infrequent: it's a real OS process
+        # spawn, not free, and sensor_health.py's per-sensor heartbeat
+        # already catches the common "sensor thread died" case within 60s -
+        # this check is for the rarer, worse case of "the thread is alive
+        # but isn't actually seeing real events".
+        'interval_seconds': 300,
+        'timeout_seconds': 15,
+    },
 }
 
 

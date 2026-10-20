@@ -96,6 +96,10 @@ class ProcessCorrelator:
             if sysmon_fields is None:
                 continue  # ETW-only: already dispatched provisionally at submission time.
             if etw_fields is not None:
+                try:
+                    self._check_ancestry_contradiction(key, etw_fields, sysmon_fields)
+                except Exception as e:
+                    logging.error(f"[CORRELATOR] Contradiction check failed for {key}: {e}")
                 data = {**sysmon_fields, '_source': 'fused', '_provisional': False, '_dedup_key': key}
             else:
                 data = {**sysmon_fields, '_source': 'sysmon', '_dedup_key': key}
@@ -103,6 +107,36 @@ class ProcessCorrelator:
                 self.engine._dispatch(1, data)
             except Exception as e:
                 logging.error(f"[CORRELATOR] Dispatch failed for {key}: {e}")
+
+    def _check_ancestry_contradiction(self, pid, etw_fields, sysmon_fields):
+        """Both sensors observed the same real PID independently - if they
+        disagree about who its parent was, that disagreement is itself
+        security-relevant (a PID-reuse race, a spoofed parent, or one
+        sensor being fed doctored data) and must never be silently resolved
+        by whichever field the fused-event merge above happens to keep.
+        Logged as its own [TELEMETRY_CONTRADICTION] line (which the
+        dashboard categorizes and surfaces distinctly - see
+        dashboard_data.CATEGORY_RULES) rather than folded into the fused
+        dispatch, so the discrepancy can't get lost inside a normal-looking
+        process-create event.
+
+        Scoped to parent-PID ancestry only, the one field both independent
+        kernel sensors actually carry today (see etw_monitor.py's docstring
+        on the raw ETW event's thin field set) - extend to other fields
+        (module state, file/network activity) once a sensor for those feeds
+        the correlator."""
+        etw_ppid, sysmon_ppid = etw_fields.get('ParentProcessId'), sysmon_fields.get('ParentProcessId')
+        if etw_ppid is None or sysmon_ppid is None:
+            return
+        try:
+            etw_ppid, sysmon_ppid = int(etw_ppid), int(sysmon_ppid)
+        except (TypeError, ValueError):
+            return
+        if etw_ppid != sysmon_ppid:
+            logging.warning(
+                f"[TELEMETRY_CONTRADICTION] PID {pid}: independent sensors disagree on parent "
+                f"process - ETW reports parent PID {etw_ppid}, Sysmon reports parent PID {sysmon_ppid}"
+            )
 
     def gc_loop(self):
         while True:

@@ -131,6 +131,76 @@ def test_lock_is_never_held_across_a_dispatch_call():
     assert not engine.lock_held_during_dispatch
 
 
+def test_contradiction_logged_when_parent_pids_disagree():
+    calls = []
+    original_warning = pc.logging.warning
+    pc.logging.warning = lambda msg: calls.append(msg)
+    try:
+        engine = _FakeEngine()
+        correlator = pc.ProcessCorrelator(engine, fuse_window=0.01)
+        correlator.submit_etw(1234, 1, "evil.exe", "t")  # parent PID 1
+        correlator.submit_sysmon({'ProcessId': 1234, 'ParentProcessId': 999, 'Image': 'evil.exe'}, "t")
+        time.sleep(0.02)
+        correlator._gc_once()
+        contradiction_lines = [c for c in calls if "[TELEMETRY_CONTRADICTION]" in c]
+        assert len(contradiction_lines) == 1
+        assert "PID 1234" in contradiction_lines[0]
+        assert "ETW reports parent PID 1" in contradiction_lines[0]
+        assert "Sysmon reports parent PID 999" in contradiction_lines[0]
+        # the discrepancy must not have blocked the normal fused dispatch
+        assert len(engine.dispatches) == 2
+        assert engine.dispatches[1][1]['_source'] == 'fused'
+    finally:
+        pc.logging.warning = original_warning
+
+
+def test_no_contradiction_logged_when_parent_pids_agree():
+    calls = []
+    original_warning = pc.logging.warning
+    pc.logging.warning = lambda msg: calls.append(msg)
+    try:
+        engine = _FakeEngine()
+        correlator = pc.ProcessCorrelator(engine, fuse_window=0.01)
+        correlator.submit_etw(1234, 1, "evil.exe", "t")  # parent PID 1
+        correlator.submit_sysmon({'ProcessId': 1234, 'ParentProcessId': 1, 'Image': 'evil.exe'}, "t")
+        time.sleep(0.02)
+        correlator._gc_once()
+        assert not any("[TELEMETRY_CONTRADICTION]" in c for c in calls)
+    finally:
+        pc.logging.warning = original_warning
+
+
+def test_no_contradiction_logged_when_sysmon_omits_parent_pid():
+    # A missing field is a data gap, not a disagreement - must not be
+    # treated as a contradiction (that would false-positive on every
+    # Sysmon config that doesn't capture ParentProcessId).
+    calls = []
+    original_warning = pc.logging.warning
+    pc.logging.warning = lambda msg: calls.append(msg)
+    try:
+        engine = _FakeEngine()
+        correlator = pc.ProcessCorrelator(engine, fuse_window=0.01)
+        correlator.submit_etw(1234, 1, "evil.exe", "t")
+        correlator.submit_sysmon({'ProcessId': 1234, 'Image': 'evil.exe'}, "t")  # no ParentProcessId
+        time.sleep(0.02)
+        correlator._gc_once()
+        assert not any("[TELEMETRY_CONTRADICTION]" in c for c in calls)
+    finally:
+        pc.logging.warning = original_warning
+
+
+def test_contradiction_check_tolerates_malformed_parent_pid():
+    # A garbled/non-numeric field must not crash the GC pass - the dispatch
+    # for this pid still has to go through.
+    engine = _FakeEngine()
+    correlator = pc.ProcessCorrelator(engine, fuse_window=0.01)
+    correlator.submit_etw(1234, 1, "evil.exe", "t")
+    correlator.submit_sysmon({'ProcessId': 1234, 'ParentProcessId': 'not-a-number', 'Image': 'evil.exe'}, "t")
+    time.sleep(0.02)
+    correlator._gc_once()  # must not raise
+    assert len(engine.dispatches) == 2
+
+
 def test_gc_loop_runs_on_its_own_thread_via_start():
     engine = _FakeEngine()
     correlator = pc.ProcessCorrelator(engine, fuse_window=0.01, gc_interval=0.01)
