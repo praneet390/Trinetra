@@ -21,7 +21,14 @@
     <ConfigurationType>Driver</ConfigurationType>
     <DriverType>WDM</DriverType>
     <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
-    <Driver_SpectreMitigation>Spectre</Driver_SpectreMitigation>
+    <!-- Spectre mitigation deliberately left off: this VM's toolchain has
+         the compiler/WDK themselves but not the separate Spectre-mitigated
+         library component (lib\x64\spectre is absent from both the MSVC
+         toolset and the WDK km lib directories - confirmed, not assumed).
+         Spectre mitigation is a side-channel hardening option, not a
+         correctness requirement, and this is a test/proof-of-concept
+         driver, not something shipping to real endpoints - so this avoids
+         pulling down another VS component for no behavioral difference. -->
     <!-- Signed explicitly with our own test certificate after the build,
          not by MSBuild's built-in signing task. -->
     <SignMode>Off</SignMode>

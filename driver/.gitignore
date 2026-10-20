@@ -9,3 +9,7 @@ Release/
 *.pdb
 *.obj
 *.log
+# Compiled test-harness binaries (e.g. ppid_spoof_test.exe) - rebuild from
+# the committed .c source instead; same "never commit build output" policy
+# as the driver binaries above.
+*.exe

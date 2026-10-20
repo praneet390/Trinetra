@@ -21,7 +21,14 @@
     <ConfigurationType>Driver</ConfigurationType>
     <DriverType>WDM</DriverType>
     <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
-    <Driver_SpectreMitigation>Spectre</Driver_SpectreMitigation>
+    <!-- Spectre mitigation deliberately left off: this VM's toolchain has
+         the compiler/WDK themselves but not the separate Spectre-mitigated
+         library component (lib\x64\spectre is absent from both the MSVC
+         toolset and the WDK km lib directories - confirmed, not assumed).
+         Spectre mitigation is a side-channel hardening option, not a
+         correctness requirement, and this is a test/proof-of-concept
+         driver, not something shipping to real endpoints - so this avoids
+         pulling down another VS component for no behavioral difference. -->
     <!-- Signed explicitly with our own test certificate after the build,
          not by MSBuild's built-in signing task. -->
     <SignMode>Off</SignMode>
@@ -43,6 +50,17 @@
       <WarningLevel>Level4</WarningLevel>
       <TreatWarningAsError>true</TreatWarningAsError>
     </ClCompile>
+    <Link>
+      <!-- PsSetCreateProcessNotifyRoutineEx specifically requires the
+           calling driver's image to have IMAGE_DLLCHARACTERISTICS_FORCE_
+           INTEGRITY set in its PE header - without it the registration
+           call returns STATUS_ACCESS_DENIED (0xC0000022) even though the
+           driver itself loads, runs DriverEntry, and is correctly signed/
+           trusted. This is this one API's own extra requirement, not a
+           general driver-signing problem - see
+           https://ired.team/miscellaneous-reversing-forensics/windows-kernel/subscribing-to-process-creation-thread-creation-and-image-load-notifications-from-a-kernel-driver -->
+      <AdditionalOptions>/integritycheck %(AdditionalOptions)</AdditionalOptions>
+    </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="sensor.c" />
