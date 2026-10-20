@@ -622,31 +622,40 @@ def test_ancestry_endpoint_400_for_garbage_pid():
     assert status == 400
 
 
+class _MonkeyPatch:
+    """Minimal stand-in for pytest's `monkeypatch` fixture, for this file's
+    standalone `python test_web_server.py` runner (pytest's fixture
+    injection isn't available outside pytest itself). Tracks every setattr
+    so it can be undone after the test, matching pytest's per-test teardown."""
+    def __init__(self):
+        self._undo = []
+
+    def setattr(self, obj, name, value):
+        self._undo.append((obj, name, getattr(obj, name)))
+        setattr(obj, name, value)
+
+    def undo(self):
+        for obj, name, old in reversed(self._undo):
+            setattr(obj, name, old)
+
+
 if __name__ == "__main__":
-    test_relaunch_success_uses_absolute_script_path_and_cwd()
-    test_relaunch_declined_returns_false()
-    test_relaunch_exception_returns_false_not_raises()
-    test_wait_for_dashboard_true_when_reachable()
-    test_wait_for_dashboard_false_when_unreachable()
-    test_process_activity_store_captures_process_create_only()
-    test_process_activity_store_newest_first_and_bounded()
-    test_backend_wires_engine_events_into_process_activity_and_tracker()
-    test_backend_constructs_rule_engine_and_config()
-    test_rules_endpoint_reflects_rule_engine_summary()
-    test_backend_surfaces_telemetry_contradiction_as_a_categorized_alert()
-    test_backend_summary_blind_state_critically_blind_before_start()
-    test_backend_summary_blind_state_healthy_when_both_sensors_live()
-    test_backend_summary_blind_state_degraded_when_one_sensor_down()
-    test_backend_summary_blind_state_partially_blind_once_events_were_seen()
-    test_backend_summary_blind_state_recovers_when_sensor_comes_back()
-    test_backend_summary_negative_evidence_reliable_only_when_healthy()
-    test_backend_summary_visibility_caveat_distinguishes_degraded_from_critically_blind()
-    test_backend_summary_reports_a_lossy_sensor_its_drop_count_and_recovery()
-    test_backend_stop_releases_the_etw_session_exactly_once()
-    test_backend_stop_without_an_etw_session_is_harmless()
-    test_main_releases_the_etw_session_on_ctrl_c()
-    test_main_releases_the_etw_session_when_the_port_is_already_taken()
-    test_main_releases_the_etw_session_on_an_unexpected_error()
-    test_main_releases_the_etw_session_even_if_backend_start_fails_midway()
-    test_dashboard_server_refuses_to_share_a_port()
-    print("OK")
+    import inspect
+
+    # Auto-collect every test_* function, same pattern every other test file
+    # in this repo uses - the previous hand-written call list here silently
+    # dropped 13 tests (every HANDS-ON alert, Live Agent Feedback, and
+    # Ancestry endpoint test added alongside it) because nothing enforced
+    # that the list stayed in sync with what was actually defined below.
+    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    for t in tests:
+        if "monkeypatch" in inspect.signature(t).parameters:
+            mp = _MonkeyPatch()
+            try:
+                t(mp)
+            finally:
+                mp.undo()
+        else:
+            t()
+        print(f"  ok  {t.__name__}")
+    print(f"OK ({len(tests)} checks)")

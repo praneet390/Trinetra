@@ -242,9 +242,35 @@ def test_first_seen_of():
     assert isinstance(t.first_seen_of(42), float)
 
 
+class _MonkeyPatch:
+    """Minimal stand-in for pytest's `monkeypatch` fixture, for this file's
+    standalone `python test_process_tracker.py` runner (pytest's fixture
+    injection isn't available outside pytest itself). Tracks every setattr
+    so it can be undone after the test, matching pytest's per-test teardown."""
+    def __init__(self):
+        self._undo = []
+
+    def setattr(self, obj, name, value):
+        self._undo.append((obj, name, getattr(obj, name)))
+        setattr(obj, name, value)
+
+    def undo(self):
+        for obj, name, old in reversed(self._undo):
+            setattr(obj, name, old)
+
+
 if __name__ == "__main__":
+    import inspect
+
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for t in tests:
-        t()
+        if "monkeypatch" in inspect.signature(t).parameters:
+            mp = _MonkeyPatch()
+            try:
+                t(mp)
+            finally:
+                mp.undo()
+        else:
+            t()
         print(f"  ok  {t.__name__}")
     print(f"OK ({len(tests)} checks)")
