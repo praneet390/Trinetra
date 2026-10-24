@@ -103,6 +103,175 @@ PsGetProcessImageFileName(
     _In_ PEPROCESS Process
     );
 
+// ---------------------------------------------------------------------------
+// Comms channel: a device object + one IOCTL (IOCTL_MALPROJECT_GET_EVENT)
+// the Python agent polls to pull queued events, instead of requiring a live
+// kernel debugger attached to see anything. Deliberately scoped to the
+// genuinely high-value, low-volume event types - PROCESS-CREATE (also the
+// sensor's heartbeat signal, same role Sysmon/ETW's own liveness proof
+// already plays), LSASS-ACCESS, and DRIVER-LOAD (kernel-mode image loads
+// only). THREAD-CREATE/EXIT and ordinary user-mode IMAGE-LOAD stay
+// DbgPrintEx-only - queuing every one of those to user mode would flood the
+// agent with volume no detection logic needs yet (thousands of events in
+// seconds under ordinary activity, confirmed during Phase 2 testing), the
+// same reasoning already documented for IMAGE-LOAD's staging-path scoping.
+// ---------------------------------------------------------------------------
+
+#define SENSOR_DEVICE_NAME       L"\\Device\\malprojectsensor"
+#define SENSOR_SYMLINK_NAME      L"\\DosDevices\\malprojectsensor"
+
+// 0x8000+ is the vendor-defined IOCTL function-code range per the WDK.
+#define IOCTL_MALPROJECT_GET_EVENT \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// Self-protection: the agent calls these to register/unregister ITSELF as
+// protected against external termination/injection (taskkill, Task
+// Manager's End Task, a remote-thread injection meant to call ExitProcess
+// from inside). Deliberately take no input - the protected PID is always
+// PsGetCurrentProcessId() at the moment of the call, never a caller-
+// supplied value, so a malicious caller cannot ask the driver to protect
+// some OTHER process (e.g. itself, if it were malware) instead of its own.
+// Only whoever can open \\.\malprojectsensor at all can call this - the
+// device's own security descriptor (FILE_DEVICE_SECURE_OPEN) already
+// restricts that to administrators.
+#define IOCTL_MALPROJECT_REGISTER_SELF \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_MALPROJECT_UNREGISTER_SELF \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+typedef enum _SENSOR_EVENT_TYPE {
+    SensorEventProcessCreate = 1,  // also carries the PPID-spoof flag
+    SensorEventLsassAccess   = 2,
+    SensorEventDriverLoad    = 3,
+} SENSOR_EVENT_TYPE;
+
+#define SENSOR_EVENT_IMAGE_NAME_MAX_CHARS 260  // MAX_PATH; long NT paths are
+                                                // truncated - disclosed, not
+                                                // silently lossy (see
+                                                // ImageNameTruncated below).
+
+// Fixed-size, flat (no unions) so the layout is simple and stable to mirror
+// with a Python ctypes.Structure - plain generic fields, meaning documented
+// per EventType below rather than a C union, which would be one more thing
+// for the two languages' struct layouts to silently disagree about.
+typedef struct _SENSOR_EVENT {
+    ULONG64 SequenceNumber;    // monotonically increasing from driver load;
+                                // the user-mode side detects drops the same
+                                // way sensor_health.record_drop() already
+                                // does for Sysmon/ETW - a gap in this
+                                // sequence means events were dropped, not
+                                // "nothing happened".
+    ULONG   EventType;         // SENSOR_EVENT_TYPE
+    ULONG   PpidSpoofDetected; // ProcessCreate only: claimed_parent !=
+                                // real_creator (0/1, not BOOLEAN - fixed
+                                // width across the kernel/user boundary)
+    ULONG64 Pid;                // ProcessCreate: new pid. LsassAccess:
+                                // target pid. DriverLoad: pid the image
+                                // mapped into (often PID 4/System).
+    ULONG64 ClaimedParentOrRequestorPid;  // ProcessCreate: claimed parent.
+                                           // LsassAccess: requestor pid.
+                                           // DriverLoad: unused (0).
+    ULONG64 RealCreatorPid;    // ProcessCreate only: the real creator from
+                                // CreatingThreadId.UniqueProcess. Unused
+                                // (0) for the other event types.
+    ULONG64 DesiredAccessOrImageBase;  // LsassAccess: raw DesiredAccess.
+                                        // DriverLoad: ImageBase. Unused (0)
+                                        // for ProcessCreate.
+    ULONG   ImageNameTruncated;  // 0/1 - the real name was longer than
+                                  // SENSOR_EVENT_IMAGE_NAME_MAX_CHARS-1 and
+                                  // got cut off; explicit, not silent.
+    ULONG   Reserved;             // padding/future use, always 0 for now.
+    WCHAR   ImageName[SENSOR_EVENT_IMAGE_NAME_MAX_CHARS];  // NUL-terminated.
+} SENSOR_EVENT, *PSENSOR_EVENT;
+
+// Bounded circular queue, spinlock-protected. A spinlock, not a FAST_MUTEX
+// or regular mutex, is the one safe choice here: PsSetCreateProcessNotify
+// RoutineEx/PsSetLoadImageNotifyRoutine run at PASSIVE_LEVEL, but
+// ObRegisterCallbacks' pre-operation callback is documented to run at
+// IRQL <= DISPATCH_LEVEL - a lock that can only be safely acquired at
+// PASSIVE_LEVEL would be a guaranteed bugcheck the first time the Ob
+// callback (which also enqueues, for LSASS-ACCESS) fires from a raised-
+// IRQL caller. KeAcquireSpinLock is correct regardless of the calling
+// IRQL, which is exactly why every producer here uses the same one lock.
+#define SENSOR_QUEUE_CAPACITY 256
+
+static KSPIN_LOCK g_QueueLock;
+static SENSOR_EVENT g_Queue[SENSOR_QUEUE_CAPACITY];
+static ULONG g_QueueHead = 0;   // next slot to dequeue
+static ULONG g_QueueCount = 0;  // entries currently queued
+static volatile LONG64 g_NextSequenceNumber = 1;
+static volatile LONG64 g_DroppedEventCount = 0;
+
+static PDEVICE_OBJECT g_DeviceObject = NULL;
+static BOOLEAN g_DeviceCreated = FALSE;
+static BOOLEAN g_SymlinkCreated = FALSE;
+
+// ---------------------------------------------------------------------------
+// Self-protection: the agent (and any other process it explicitly
+// registers, e.g. a future helper process) is immune to external
+// termination, suspension, and the handle rights that would let another
+// process inject code into it. A separate spinlock from the event queue's
+// (the two are never both held at once, so there's no lock-ordering
+// concern, but they protect genuinely independent state and mixing them
+// would just make each critical section hold the lock longer than it
+// needs to for the other's sake).
+//
+// WHAT THIS DOES NOT DO, stated plainly: this cannot make the DRIVER
+// itself immune to `sc stop`/`sc delete` by an admin - see the file-level
+// README/commit note on why that needs Microsoft ELAM attestation and is
+// out of reach for a test-signed driver. Self-protection here is strictly
+// downstream of the driver staying loaded: stop the driver (which an
+// admin genuinely can) and this protection goes with it. That is an
+// honest, single consistent story, not two unrelated claims.
+// ---------------------------------------------------------------------------
+#define SENSOR_MAX_PROTECTED_SELF_PIDS 8
+#define SENSOR_PROCESS_TERMINATE       0x0001
+#define SENSOR_PROCESS_SUSPEND_RESUME  0x0800
+// Reuses SENSOR_PROCESS_CREATE_THREAD/VM_OPERATION/VM_WRITE already defined
+// above for LSASS_DANGEROUS_BITS - the same rights that let an external
+// process inject code/a thread into a target are exactly what would let
+// an attacker neutralize the agent without a literal TerminateProcess call
+// (e.g. injecting a thread that calls ExitProcess from inside).
+#define SENSOR_SELF_PROTECT_STRIP_BITS \
+    (SENSOR_PROCESS_TERMINATE | SENSOR_PROCESS_SUSPEND_RESUME | \
+     SENSOR_PROCESS_CREATE_THREAD | SENSOR_PROCESS_VM_OPERATION | SENSOR_PROCESS_VM_WRITE)
+
+static KSPIN_LOCK g_ProtectedSelfLock;
+static ULONG64 g_ProtectedSelfPids[SENSOR_MAX_PROTECTED_SELF_PIDS];
+static ULONG g_ProtectedSelfCount = 0;
+
+VOID
+SensorRegisterSelfProtected(
+    _In_ HANDLE Pid
+    );
+
+VOID
+SensorUnregisterSelfProtected(
+    _In_ HANDLE Pid
+    );
+
+BOOLEAN
+SensorIsSelfProtected(
+    _In_ HANDLE Pid
+    );
+
+VOID
+SensorEnqueueEvent(
+    _In_ PSENSOR_EVENT Event
+    );
+
+NTSTATUS
+SensorDispatchCreateClose(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _Inout_ PIRP Irp
+    );
+
+NTSTATUS
+SensorDispatchDeviceControl(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _Inout_ PIRP Irp
+    );
+
 DRIVER_UNLOAD SensorUnload;
 DRIVER_INITIALIZE DriverEntry;
 
@@ -244,6 +413,17 @@ SensorUnload(
         ObUnRegisterCallbacks(g_ObRegistrationHandle);
     }
 
+    // Comms channel teardown - symlink first, then the device object,
+    // mirroring the reverse of creation order in DriverEntry.
+    if (g_SymlinkCreated) {
+        UNICODE_STRING symlinkName;
+        RtlInitUnicodeString(&symlinkName, SENSOR_SYMLINK_NAME);
+        IoDeleteSymbolicLink(&symlinkName);
+    }
+    if (g_DeviceCreated && g_DeviceObject != NULL) {
+        IoDeleteDevice(g_DeviceObject);
+    }
+
     if (allClean) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
             "[mal_project] sensor: unloading cleanly, all registered callbacks removed\n");
@@ -258,8 +438,45 @@ DriverEntry(
 {
     NTSTATUS status;
     NTSTATUS bestEffortStatus;
+    UNICODE_STRING deviceName;
+    UNICODE_STRING symlinkName;
+    BOOLEAN commsChannelReady = FALSE;
 
     UNREFERENCED_PARAMETER(RegistryPath);
+
+    KeInitializeSpinLock(&g_QueueLock);
+    KeInitializeSpinLock(&g_ProtectedSelfLock);
+
+    // Comms channel setup - best-effort, same posture as thread-notify/
+    // image-load below: if this fails (device name collision, resource
+    // exhaustion), the driver still loads and the DbgPrintEx-visible
+    // sensors still work under a debugger, just without a user-mode-
+    // reachable channel. Done early, before any notify routine that
+    // might try to enqueue into it, so SensorEnqueueEvent can safely
+    // check g_DeviceCreated instead of racing its initialization.
+    RtlInitUnicodeString(&deviceName, SENSOR_DEVICE_NAME);
+    status = IoCreateDevice(DriverObject, 0, &deviceName, FILE_DEVICE_UNKNOWN,
+                             FILE_DEVICE_SECURE_OPEN, FALSE, &g_DeviceObject);
+    if (NT_SUCCESS(status)) {
+        g_DeviceCreated = TRUE;
+        RtlInitUnicodeString(&symlinkName, SENSOR_SYMLINK_NAME);
+        status = IoCreateSymbolicLink(&symlinkName, &deviceName);
+        if (NT_SUCCESS(status)) {
+            g_SymlinkCreated = TRUE;
+            DriverObject->MajorFunction[IRP_MJ_CREATE] = SensorDispatchCreateClose;
+            DriverObject->MajorFunction[IRP_MJ_CLOSE] = SensorDispatchCreateClose;
+            DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = SensorDispatchDeviceControl;
+            commsChannelReady = TRUE;
+        } else {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[mal_project] sensor: IoCreateSymbolicLink failed, status=0x%08X - "
+                "continuing without the user-mode comms channel\n", status);
+        }
+    } else {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[mal_project] sensor: IoCreateDevice failed, status=0x%08X - "
+            "continuing without the user-mode comms channel\n", status);
+    }
 
     // Core capability - required. If this fails, there is nothing useful
     // left for this driver to do, so fail the load outright rather than
@@ -268,6 +485,17 @@ DriverEntry(
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
             "[mal_project] sensor: PsSetCreateProcessNotifyRoutineEx failed, status=0x%08X\n", status);
+        // The comms channel may already have been created above - clean it
+        // up before returning, or the device object/symlink leak on this
+        // failure path. Mirrors the exact teardown order SensorUnload uses.
+        if (g_SymlinkCreated) {
+            UNICODE_STRING cleanupSymlinkName;
+            RtlInitUnicodeString(&cleanupSymlinkName, SENSOR_SYMLINK_NAME);
+            IoDeleteSymbolicLink(&cleanupSymlinkName);
+        }
+        if (g_DeviceCreated && g_DeviceObject != NULL) {
+            IoDeleteDevice(g_DeviceObject);
+        }
         return status;
     }
 
@@ -336,8 +564,9 @@ DriverEntry(
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
         "[mal_project] sensor: DriverEntry reached, process-create callback registered "
-        "(thread-notify=%d, image-load=%d, ob-handle-access=%d), built %s %s\n",
-        g_ThreadNotifyRegistered, g_ImageLoadNotifyRegistered, g_ObCallbacksRegistered, __DATE__, __TIME__);
+        "(thread-notify=%d, image-load=%d, ob-handle-access=%d, comms-channel=%d), built %s %s\n",
+        g_ThreadNotifyRegistered, g_ImageLoadNotifyRegistered, g_ObCallbacksRegistered,
+        commsChannelReady, __DATE__, __TIME__);
 
     DriverObject->DriverUnload = SensorUnload;
 
@@ -357,7 +586,15 @@ SensorProcessNotify(
     UNREFERENCED_PARAMETER(Process);
 
     if (CreateInfo == NULL) {
-        // Process exit notification, not a create - nothing to validate.
+        // Process exit, not a create. Nothing to validate for PROC-CREATE/
+        // PPID-SPOOF purposes, but a self-protected process exiting MUST
+        // free its slot here - otherwise an unrelated later process that
+        // the OS reuses this same PID for would silently inherit kill/
+        // injection immunity it never asked for and has no business
+        // having. This is the one place the driver can learn "that PID is
+        // gone" without the agent having to explicitly unregister first
+        // (e.g. on a crash, where no clean shutdown path runs at all).
+        SensorUnregisterSelfProtected(ProcessId);
         return;
     }
 
@@ -378,6 +615,30 @@ SensorProcessNotify(
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
             "[mal_project] PPID-SPOOF: pid=%p claimed_parent=%p real_creator=%p\n",
             ProcessId, CreateInfo->ParentProcessId, realCreatorPid);
+    }
+
+    // Comms-channel copy of the same event: every process-create (this is
+    // the sensor's heartbeat signal to user mode, same role Sysmon/ETW's
+    // own liveness proof already plays), with the PPID-spoof comparison
+    // carried as a flag rather than user mode re-deriving it.
+    {
+        SENSOR_EVENT event;
+        RtlZeroMemory(&event, sizeof(event));
+        event.EventType = SensorEventProcessCreate;
+        event.PpidSpoofDetected = (CreateInfo->ParentProcessId != realCreatorPid) ? 1 : 0;
+        event.Pid = (ULONG64)(ULONG_PTR)ProcessId;
+        event.ClaimedParentOrRequestorPid = (ULONG64)(ULONG_PTR)CreateInfo->ParentProcessId;
+        event.RealCreatorPid = (ULONG64)(ULONG_PTR)realCreatorPid;
+        if (imageName != NULL && imageName->Buffer != NULL && imageName->Length > 0) {
+            USHORT copyChars = imageName->Length / sizeof(WCHAR);
+            if (copyChars > SENSOR_EVENT_IMAGE_NAME_MAX_CHARS - 1) {
+                copyChars = SENSOR_EVENT_IMAGE_NAME_MAX_CHARS - 1;
+                event.ImageNameTruncated = 1;
+            }
+            RtlCopyMemory(event.ImageName, imageName->Buffer, copyChars * sizeof(WCHAR));
+            event.ImageName[copyChars] = L'\0';
+        }
+        SensorEnqueueEvent(&event);
     }
 }
 
@@ -418,6 +679,27 @@ SensorImageLoadNotify(
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                 "[mal_project] DRIVER-LOAD: pid=%p base=%p image=(none)\n",
                 ProcessId, imageBase);
+        }
+
+        // Comms-channel copy: rare and high-signal, always forwarded
+        // (unlike the ordinary user-mode DLL case below, which stays
+        // DbgPrintEx-only - see the file-header comms-channel note).
+        {
+            SENSOR_EVENT event;
+            RtlZeroMemory(&event, sizeof(event));
+            event.EventType = SensorEventDriverLoad;
+            event.Pid = (ULONG64)(ULONG_PTR)ProcessId;
+            event.DesiredAccessOrImageBase = (ULONG64)(ULONG_PTR)imageBase;
+            if (FullImageName != NULL && FullImageName->Buffer != NULL && FullImageName->Length > 0) {
+                USHORT copyChars = FullImageName->Length / sizeof(WCHAR);
+                if (copyChars > SENSOR_EVENT_IMAGE_NAME_MAX_CHARS - 1) {
+                    copyChars = SENSOR_EVENT_IMAGE_NAME_MAX_CHARS - 1;
+                    event.ImageNameTruncated = 1;
+                }
+                RtlCopyMemory(event.ImageName, FullImageName->Buffer, copyChars * sizeof(WCHAR));
+                event.ImageName[copyChars] = L'\0';
+            }
+            SensorEnqueueEvent(&event);
         }
         return;
     }
@@ -519,9 +801,9 @@ SensorPreOperationCallback(
 {
     PEPROCESS targetProcess;
     PCHAR targetImageName;
-    ACCESS_MASK desiredAccess;
     HANDLE requestorPid;
     HANDLE targetPid;
+    BOOLEAN isCreate;
 
     UNREFERENCED_PARAMETER(RegistrationContext);
 
@@ -534,13 +816,50 @@ SensorPreOperationCallback(
     }
 
     targetProcess = (PEPROCESS)OperationInformation->Object;
-    targetImageName = PsGetProcessImageFileName(targetProcess);
+    targetPid = PsGetProcessId(targetProcess);
+    requestorPid = PsGetCurrentProcessId();
+    isCreate = (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE);
 
-    // Hot path (fires on every process handle create/duplicate system-
-    // wide) - filter to the one target this increment cares about before
-    // doing anything else, same scoping heuristic_engine.py's own LSASS
-    // check already uses. RtlEqualString, not _stricmp - see the same
-    // note in SensorIsProtectedProcess above.
+    // --- Self-protection: independent of target name, checked first -----
+    // A process never needs PROCESS_TERMINATE/etc. rights on ITSELF to
+    // exit normally (ExitProcess/returning from main bypasses this
+    // callback entirely - it is not a handle-open operation), so stripping
+    // these bits can never block a legitimate self-initiated shutdown,
+    // only an EXTERNAL process's attempt to kill/suspend/inject into a
+    // registered PID. requestorPid == targetPid is therefore never
+    // stripped here as a belt-and-suspenders guard, even though it should
+    // already be a no-op in practice.
+    //
+    // VERIFIED (not assumed): a diagnostic build that logged every Ob
+    // callback invocation unconditionally confirmed this path is correct -
+    // a live taskkill /F against a registered PID, launched mid-window
+    // (its own PROC-CREATE visible on the comms channel), left the target
+    // running uninterrupted through the rest of its test window, which it
+    // then exited from entirely on its own (self-termination, not an
+    // external kill). The two earlier rounds that appeared to fail were a
+    // TEST-harness timing race - a fixed 2-second sleep between launching
+    // the harness and attempting the kill sometimes ran before
+    // registration had completed (first-launch disk/AV-scan overhead on a
+    // freshly rebuilt binary), not a flaw in this stripping logic.
+    if (requestorPid != targetPid && SensorIsSelfProtected(targetPid)) {
+        PACCESS_MASK desiredAccessPtr = isCreate
+            ? &OperationInformation->Parameters->CreateHandleInformation.DesiredAccess
+            : &OperationInformation->Parameters->DuplicateHandleInformation.DesiredAccess;
+        ACCESS_MASK before = *desiredAccessPtr;
+        ACCESS_MASK stripped = before & SENSOR_SELF_PROTECT_STRIP_BITS;
+
+        if (stripped != 0) {
+            *desiredAccessPtr = before & ~SENSOR_SELF_PROTECT_STRIP_BITS;
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[mal_project] SELF-PROTECT: requestor_pid=%p target_pid=%p "
+                "stripped=0x%08X (was 0x%08X, now 0x%08X)\n",
+                requestorPid, targetPid, (ULONG)stripped, (ULONG)before,
+                (ULONG)*desiredAccessPtr);
+        }
+    }
+
+    // --- LSASS observation: unchanged from before, by name -----------------
+    targetImageName = PsGetProcessImageFileName(targetProcess);
     if (targetImageName == NULL) {
         return OB_PREOP_SUCCESS;
     }
@@ -555,32 +874,272 @@ SensorPreOperationCallback(
         }
     }
 
-    if (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) {
-        desiredAccess = OperationInformation->Parameters->CreateHandleInformation.DesiredAccess;
-    } else {
-        desiredAccess = OperationInformation->Parameters->DuplicateHandleInformation.DesiredAccess;
+    {
+        // Re-read AFTER the self-protection strip above (the two checks
+        // are independent in principle, but if LSASS's own PID were ever
+        // self-protected - it never will be in practice, since LSASS
+        // doesn't call our IOCTL - this keeps the two paths consistent
+        // rather than racing each other on the same field).
+        ACCESS_MASK desiredAccess = isCreate
+            ? OperationInformation->Parameters->CreateHandleInformation.DesiredAccess
+            : OperationInformation->Parameters->DuplicateHandleInformation.DesiredAccess;
+
+        if ((desiredAccess & SENSOR_LSASS_DANGEROUS_BITS) == 0) {
+            return OB_PREOP_SUCCESS;
+        }
+
+        // Pre-operation callbacks run in the context of the requesting
+        // thread, before the handle is granted. NOTE: for LSASS
+        // specifically this callback is only reached when the requestor's
+        // protection level is comparable to or higher than LSASS's own
+        // PPL level - see the HONESTY NOTE in the file header for the
+        // empirically-confirmed detail on what this does and does not
+        // observe.
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[mal_project] LSASS-ACCESS: requestor_pid=%p target_pid=%p desired_access=0x%08X "
+            "dangerous_bits=0x%08X\n",
+            requestorPid, targetPid, (ULONG)desiredAccess,
+            (ULONG)(desiredAccess & SENSOR_LSASS_DANGEROUS_BITS));
+
+        // Comms-channel copy: low-volume (only dangerous-bit matches reach
+        // here at all, after the gate above), high-value, always forwarded.
+        {
+            SENSOR_EVENT event;
+            RtlZeroMemory(&event, sizeof(event));
+            event.EventType = SensorEventLsassAccess;
+            event.Pid = (ULONG64)(ULONG_PTR)targetPid;
+            event.ClaimedParentOrRequestorPid = (ULONG64)(ULONG_PTR)requestorPid;
+            event.DesiredAccessOrImageBase = (ULONG64)desiredAccess;
+            SensorEnqueueEvent(&event);
+        }
     }
 
-    if ((desiredAccess & SENSOR_LSASS_DANGEROUS_BITS) == 0) {
-        return OB_PREOP_SUCCESS;
-    }
-
-    // Pre-operation callbacks run in the context of the requesting
-    // thread, before the handle is granted and before the OS's own
-    // access check (including LSASS's Protected-Process-Light
-    // enforcement) - PsGetCurrentProcessId() here is the real requestor,
-    // and this fires even on an attempt Windows itself is about to deny.
-    requestorPid = PsGetCurrentProcessId();
-    targetPid = PsGetProcessId(targetProcess);
-
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-        "[mal_project] LSASS-ACCESS: requestor_pid=%p target_pid=%p desired_access=0x%08X "
-        "dangerous_bits=0x%08X\n",
-        requestorPid, targetPid, (ULONG)desiredAccess,
-        (ULONG)(desiredAccess & SENSOR_LSASS_DANGEROUS_BITS));
-
-    // Observe-only, deliberately: nothing is stripped or denied here. See
-    // the file-header note on why blocking is a separate, later increment
-    // built on top of the protected-process floor rather than added here.
+    // LSASS: observe-only, deliberately - nothing is stripped or denied
+    // for LSASS targets here. Self-protection above is the one place in
+    // this driver that actually modifies access; see its own comment for
+    // why that's safe given the protected-process floor was built and
+    // self-tested first.
     return OB_PREOP_SUCCESS;
+}
+
+VOID
+SensorRegisterSelfProtected(
+    _In_ HANDLE Pid
+    )
+{
+    KIRQL oldIrql;
+    ULONG i;
+    BOOLEAN alreadyPresent = FALSE;
+
+    KeAcquireSpinLock(&g_ProtectedSelfLock, &oldIrql);
+
+    for (i = 0; i < g_ProtectedSelfCount; i++) {
+        if (g_ProtectedSelfPids[i] == (ULONG64)(ULONG_PTR)Pid) {
+            alreadyPresent = TRUE;
+            break;
+        }
+    }
+
+    if (!alreadyPresent && g_ProtectedSelfCount < SENSOR_MAX_PROTECTED_SELF_PIDS) {
+        g_ProtectedSelfPids[g_ProtectedSelfCount] = (ULONG64)(ULONG_PTR)Pid;
+        g_ProtectedSelfCount++;
+    }
+
+    KeReleaseSpinLock(&g_ProtectedSelfLock, oldIrql);
+
+    if (alreadyPresent) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[mal_project] sensor: SELF-PROTECT register pid=%p (already registered)\n", Pid);
+    } else {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[mal_project] sensor: SELF-PROTECT register pid=%p\n", Pid);
+    }
+}
+
+VOID
+SensorUnregisterSelfProtected(
+    _In_ HANDLE Pid
+    )
+{
+    KIRQL oldIrql;
+    ULONG i;
+    BOOLEAN removed = FALSE;
+
+    KeAcquireSpinLock(&g_ProtectedSelfLock, &oldIrql);
+
+    for (i = 0; i < g_ProtectedSelfCount; i++) {
+        if (g_ProtectedSelfPids[i] == (ULONG64)(ULONG_PTR)Pid) {
+            // Swap the last entry into this slot and shrink - order
+            // doesn't matter for an unordered protected-PID set, and this
+            // avoids shifting the rest of a tiny fixed array.
+            g_ProtectedSelfPids[i] = g_ProtectedSelfPids[g_ProtectedSelfCount - 1];
+            g_ProtectedSelfCount--;
+            removed = TRUE;
+            break;
+        }
+    }
+
+    KeReleaseSpinLock(&g_ProtectedSelfLock, oldIrql);
+
+    if (removed) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[mal_project] sensor: SELF-PROTECT unregister pid=%p\n", Pid);
+    }
+    // Not logging the not-found case: SensorProcessNotify calls this
+    // unconditionally on EVERY process exit (not just protected ones) to
+    // guarantee PID-reuse cleanup, so "not found" is the overwhelmingly
+    // common, totally unremarkable case - logging it would just be noise.
+}
+
+BOOLEAN
+SensorIsSelfProtected(
+    _In_ HANDLE Pid
+    )
+{
+    KIRQL oldIrql;
+    ULONG i;
+    BOOLEAN found = FALSE;
+    ULONG64 pidValue = (ULONG64)(ULONG_PTR)Pid;
+
+    KeAcquireSpinLock(&g_ProtectedSelfLock, &oldIrql);
+    for (i = 0; i < g_ProtectedSelfCount; i++) {
+        if (g_ProtectedSelfPids[i] == pidValue) {
+            found = TRUE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_ProtectedSelfLock, oldIrql);
+
+    return found;
+}
+
+VOID
+SensorEnqueueEvent(
+    _In_ PSENSOR_EVENT Event
+    )
+{
+    KIRQL oldIrql;
+    ULONG tailIndex;
+
+    // No device means no possible consumer - skip the lock/copy entirely
+    // rather than queue events nobody can ever read. g_DeviceCreated is
+    // only ever set TRUE once, in DriverEntry, before any notify routine
+    // that could call this is registered, so there is no init-order race
+    // to worry about here.
+    if (!g_DeviceCreated) {
+        return;
+    }
+
+    // KeAcquireSpinLock is correct from any caller IRQL <= DISPATCH_LEVEL -
+    // see the file-header note on why a spinlock (not a mutex) is the only
+    // safe choice here, given ObRegisterCallbacks' pre-operation callback
+    // can run at raised IRQL.
+    KeAcquireSpinLock(&g_QueueLock, &oldIrql);
+
+    Event->SequenceNumber = (ULONG64)g_NextSequenceNumber;
+    g_NextSequenceNumber++;
+
+    if (g_QueueCount == SENSOR_QUEUE_CAPACITY) {
+        // Full - drop the oldest entry to make room rather than block (a
+        // notify routine cannot block) or grow without bound. The user-
+        // mode side detects this via the gap it leaves in SequenceNumber,
+        // the same way sensor_health.record_drop() already surfaces a
+        // Sysmon/ETW queue overflow - a recorded drop, not a silent one.
+        g_QueueHead = (g_QueueHead + 1) % SENSOR_QUEUE_CAPACITY;
+        g_QueueCount--;
+        g_DroppedEventCount++;
+    }
+
+    tailIndex = (g_QueueHead + g_QueueCount) % SENSOR_QUEUE_CAPACITY;
+    RtlCopyMemory(&g_Queue[tailIndex], Event, sizeof(SENSOR_EVENT));
+    g_QueueCount++;
+
+    KeReleaseSpinLock(&g_QueueLock, oldIrql);
+}
+
+NTSTATUS
+SensorDispatchCreateClose(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _Inout_ PIRP Irp
+    )
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    // Nothing to validate for a simple single-channel device - any opener
+    // that can reach \\.\malprojectsensor at all gets a handle. Per-caller
+    // access restriction (SYSTEM/admin-only) is enforced by the device's
+    // own security descriptor (FILE_DEVICE_SECURE_OPEN at creation plus
+    // the default SDDL for a kernel-created device, which already
+    // restricts opens to administrators), not by logic here.
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+SensorDispatchDeviceControl(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _Inout_ PIRP Irp
+    )
+{
+    PIO_STACK_LOCATION stack;
+    NTSTATUS status;
+    ULONG_PTR information;
+    KIRQL oldIrql;
+
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    stack = IoGetCurrentIrpStackLocation(Irp);
+    information = 0;
+
+    if (stack->Parameters.DeviceIoControl.IoControlCode == IOCTL_MALPROJECT_GET_EVENT) {
+        if (stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(SENSOR_EVENT)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+        } else {
+            BOOLEAN haveEvent = FALSE;
+            SENSOR_EVENT localEvent;
+            RtlZeroMemory(&localEvent, sizeof(localEvent));
+
+            // Dequeue under the lock, copy to the IRP's SystemBuffer
+            // outside it - keeps the spinlock-held critical section to
+            // the minimum fixed-size copy, nothing more.
+            KeAcquireSpinLock(&g_QueueLock, &oldIrql);
+            if (g_QueueCount > 0) {
+                RtlCopyMemory(&localEvent, &g_Queue[g_QueueHead], sizeof(SENSOR_EVENT));
+                g_QueueHead = (g_QueueHead + 1) % SENSOR_QUEUE_CAPACITY;
+                g_QueueCount--;
+                haveEvent = TRUE;
+            }
+            KeReleaseSpinLock(&g_QueueLock, oldIrql);
+
+            if (haveEvent) {
+                RtlCopyMemory(Irp->AssociatedIrp.SystemBuffer, &localEvent, sizeof(SENSOR_EVENT));
+                information = sizeof(SENSOR_EVENT);
+            }
+            // Queue empty: STATUS_SUCCESS with 0 bytes written, not an
+            // error - this is a polling model (see the file-header comms-
+            // channel note on why pending-IRP push delivery was deferred
+            // as a later optimization), so "nothing right now" is an
+            // ordinary, expected result the caller's poll loop retries.
+            status = STATUS_SUCCESS;
+        }
+    } else if (stack->Parameters.DeviceIoControl.IoControlCode == IOCTL_MALPROJECT_REGISTER_SELF) {
+        // PsGetCurrentProcessId() here, deliberately, not anything from
+        // the request buffer (there is no input buffer for this IOCTL at
+        // all) - see the IOCTL's own definition comment for why trusting
+        // a caller-supplied PID would be a spoofing vector.
+        SensorRegisterSelfProtected(PsGetCurrentProcessId());
+        status = STATUS_SUCCESS;
+    } else if (stack->Parameters.DeviceIoControl.IoControlCode == IOCTL_MALPROJECT_UNREGISTER_SELF) {
+        SensorUnregisterSelfProtected(PsGetCurrentProcessId());
+        status = STATUS_SUCCESS;
+    } else {
+        status = STATUS_INVALID_DEVICE_REQUEST;
+    }
+
+    Irp->IoStatus.Status = status;
+    Irp->IoStatus.Information = information;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return status;
 }

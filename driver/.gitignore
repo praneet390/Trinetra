@@ -13,3 +13,8 @@ Release/
 # the committed .c source instead; same "never commit build output" policy
 # as the driver binaries above.
 *.exe
+# Captured output from running a test harness (e.g.
+# self_protect_test_output.txt) - a result of running the committed .c
+# source, not source itself.
+*_output.txt
+*_err.txt
