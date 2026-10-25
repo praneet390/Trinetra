@@ -4,6 +4,7 @@ import logging
 from static_scanner import StaticScanner
 from telemetry_monitor import start_monitor
 from etw_monitor import start_etw_monitor, stop_etw_monitor
+from kernel_sensor import ensure_driver_running, start_kernel_monitor, stop_kernel_monitor, stop_driver_service
 from heuristic_engine import HeuristicEngine
 from module_inspector import ModuleInspector
 from process_correlator import ProcessCorrelator
@@ -58,9 +59,21 @@ def main():
 
     sysmon_health = SensorHealth("sysmon")
     etw_health = SensorHealth("etw")
+    kernel_health = SensorHealth("kernel")
     sub_handle = start_monitor(engine, on_heartbeat=sysmon_health.touch, on_drop=sysmon_health.record_drop)
     etw_handle = start_etw_monitor(engine, on_heartbeat=etw_health.touch, correlator=correlator,
                                    on_drop=etw_health.record_drop)
+
+    # Third, independent kernel sensor (driver/sensor/sensor.c, see
+    # kernel_sensor.py) - ground truth for process ancestry and LSASS
+    # handle-access, unlike Sysmon/ETW's claimed-parent field. A missing/
+    # not-yet-loaded driver is a normal "sensor unavailable" condition
+    # here, same as Sysmon not being installed - ensure_driver_running()
+    # only starts the already-built-and-signed service (see that file's
+    # own docstring); it never builds or signs anything itself.
+    ensure_driver_running()
+    kernel_handle = start_kernel_monitor(engine, correlator, on_heartbeat=kernel_health.touch,
+                                         on_drop=kernel_health.record_drop)
 
     def _blind_state():
         # No dashboard is polling this CLI entrypoint, so the watchdog is
@@ -68,13 +81,13 @@ def main():
         # here - hence logging transitions loudly (see watchdog_loop)
         # rather than only exposing a value for something else to read.
         return current_blind_state(
-            [(sub_handle, sysmon_health), (etw_handle, etw_health)],
+            [(sub_handle, sysmon_health), (etw_handle, etw_health), (kernel_handle, kernel_health)],
             engine.total_events_seen,
         )
 
     threading.Thread(
         target=watchdog_loop,
-        args=([sysmon_health, etw_health],),
+        args=([sysmon_health, etw_health, kernel_health],),
         kwargs={"blind_state_fn": _blind_state},
         daemon=True,
     ).start()
@@ -83,6 +96,8 @@ def main():
         logging.warning("[-] Sysmon telemetry monitor failed to start. Continuing with reduced telemetry.")
     if not etw_handle:
         logging.warning("[-] ETW telemetry monitor failed to start. Continuing with reduced telemetry.")
+    if not kernel_handle:
+        logging.warning("[-] Kernel driver sensor failed to start. Continuing with reduced telemetry.")
 
     # Benign, periodic self-test (see self_test.py) - proves telemetry
     # actually delivers real events end-to-end, not just that the sensor
@@ -141,6 +156,12 @@ def main():
         # pywintrace's consumer thread is not a daemon; unless it is stopped the
         # process can't exit (see etw_monitor.stop_etw_monitor).
         stop_etw_monitor(etw_handle)
+        # Unregisters this process's self-protection and closes the comms
+        # channel first, then stops (not deletes) the service - mirrors the
+        # ETW session's own start/stop symmetry above. Safe to call even if
+        # kernel_handle/ensure_driver_running never succeeded.
+        stop_kernel_monitor(kernel_handle)
+        stop_driver_service()
 
 if __name__ == "__main__":
     main()

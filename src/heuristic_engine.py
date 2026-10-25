@@ -469,6 +469,70 @@ class HeuristicEngine:
         except Exception as e:
             logging.error(f"[ERROR] Handling ETW process-start event failed: {e}")
 
+    def evaluate_kernel_lsass_access(self, requestor_pid, target_pid, desired_access):
+        """Entry point for the kernel sensor's LSASS-ACCESS event
+        (driver/sensor/sensor.c's ObRegisterCallbacks observation,
+        delivered via kernel_sensor.py). Mirrors _handle_process_access's
+        existing LSASS check (same LSASS_DANGEROUS_BITS, same trusted-path
+        discount) rather than replacing it - this is an INDEPENDENT,
+        corroborating sensor, not a dedup of the Sysmon one. The two can
+        legitimately both fire for the same real attempt (that is
+        corroboration, not double-counting - see heuristic_engine's
+        general stance that independent sensors agreeing is evidence, not
+        noise) or only one can, if PPL or a missing Sysmon config stops
+        the other from ever seeing it. check_id is distinct
+        ('kernel_lsass_access') so either can be read back on its own.
+
+        Only ever called for a desired_access that already carries a
+        LSASS_DANGEROUS_BITS bit - the driver's own pre-operation callback
+        already did that filtering before this was ever queued, so no
+        re-check is needed here."""
+        try:
+            self.total_events_seen += 1
+            self.last_event_time = time.time()
+
+            try:
+                source_image = psutil.Process(requestor_pid).exe().lower()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                # Resolution failure fails CLOSED (treated as untrusted/full
+                # score) - the same posture as "can't verify, so don't
+                # discount" everywhere else safety-relevant in this engine.
+                source_image = ''
+            trusted_callers = ('\\windows\\system32\\', '\\windows\\syswow64\\')
+            is_trusted_path = any(source_image.startswith(p) or f'c:{p}' in source_image for p in trusted_callers)
+
+            access_hex = f"0x{int(desired_access):x}"
+            score = 30 if is_trusted_path else 70
+            context = (
+                f"{'Trusted-path' if is_trusted_path else 'Untrusted'} process access to LSASS "
+                f"(Access: {access_hex}) - Potential credential dumping [kernel-observed]"
+            )
+            self._record_access_edge(requestor_pid, target_pid, 'lsass.exe', access_hex)
+            self._add_score(requestor_pid, score, context, check_id='kernel_lsass_access')
+        except Exception as e:
+            logging.error(f"[ERROR] Handling kernel LSASS-access event failed: {e}")
+
+    def evaluate_kernel_driver_load(self, pid, image_name, image_base):
+        """Entry point for the kernel sensor's DRIVER-LOAD event
+        (driver/sensor/sensor.c's PsSetLoadImageNotifyRoutine, filtered to
+        kernel-mode images only - see that file's header comment). A new
+        kernel driver loading mid-session is rare on an ordinary endpoint
+        and genuinely worth surfacing, but is not on its own strong enough
+        evidence to score like a confirmed technique (legitimate Windows
+        Update/Plug-and-Play driver installs are the common case) - scored
+        low, like sedebugprivilege_iat's precursor-signal weight, so it
+        compounds with other findings rather than driving mitigation alone."""
+        try:
+            self.total_events_seen += 1
+            self.last_event_time = time.time()
+            self._add_score(
+                pid, 20,
+                f"Kernel-mode driver loaded: {image_name} (base=0x{int(image_base):x}) [kernel-observed]",
+                check_id='kernel_driver_load'
+            )
+        except Exception as e:
+            logging.error(f"[ERROR] Handling kernel driver-load event failed: {e}")
+
     def _dispatch(self, event_id, data_dict):
         """Shared tail for every event source (Sysmon XML, ETW) once it's
         been normalized into a plain dict: observer hook, hardcoded
@@ -795,6 +859,30 @@ class HeuristicEngine:
         original_name = (data.get('OriginalFileName') or '').lower()
         dedup_key = data.get('_dedup_key')
         child_name = os.path.basename(image)
+
+        # Kernel-verified PPID spoofing (driver/sensor/sensor.c's PROC-CREATE
+        # event, routed here via process_correlator.submit_kernel). Sysmon/
+        # ETW's ParentProcessId is only ever a CLAIM - a caller can legally
+        # set it to any running process via PROC_THREAD_ATTRIBUTE_PARENT_
+        # PROCESS, and neither of those two sensors can see past that. The
+        # kernel driver can: it reads the real creator from
+        # PsSetCreateProcessNotifyRoutineEx's CreatingThreadId field, which
+        # that attribute cannot influence. This is a fundamentally stronger
+        # signal than the existing [TELEMETRY_CONTRADICTION] log (which only
+        # proves Sysmon and ETW disagree with EACH OTHER about the claim,
+        # never whether the claim itself is true) - scored high enough to
+        # cross the critical mitigation threshold on its own, the same way
+        # defender_tamper already does, because kernel ground truth has no
+        # realistic false-positive path the way a text-pattern match does.
+        if data.get('_source') == 'kernel' and data.get('_kernel_ppid_spoof_detected'):
+            real_creator = data.get('_kernel_real_creator_pid')
+            claimed_parent = data.get('ParentProcessId')
+            self._score_once(
+                dedup_key, 'kernel_ppid_spoof', pid, 80,
+                f"Kernel-verified PPID spoofing: process claims parent PID {claimed_parent} but "
+                f"was actually created by PID {real_creator} (PROC_THREAD_ATTRIBUTE_PARENT_PROCESS "
+                f"or equivalent) - unspoofable kernel ground truth, not a cross-sensor inference"
+            )
 
         if 'temp' in image or 'users\\public' in image:
             self._score_once(dedup_key, 'staging_dir', pid, 30, f"Execution from staging directory: {image}")

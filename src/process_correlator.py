@@ -68,6 +68,34 @@ class ProcessCorrelator:
             '_dedup_key': pid,
         })
 
+    def submit_kernel(self, pid, claimed_parent_pid, real_creator_pid, image_name, ppid_spoof_detected):
+        """Kernel-sourced process-create (driver/sensor/sensor.c's
+        PROC-CREATE event, delivered over the comms channel by
+        kernel_sensor.py). Dispatched immediately and independently, like
+        ETW's provisional dispatch - deliberately NOT merged into the
+        pending etw/sysmon fusion dict. The driver has already computed the
+        one thing cross-sensor fusion would otherwise try to re-derive
+        (claimed vs real parent) from PsSetCreateProcessNotifyRoutineEx's
+        CreatingThreadId, which a caller cannot influence - doing it again
+        here from timestamp-matched user-mode records would only be less
+        reliable than what the kernel already knows for certain. See
+        HeuristicEngine._handle_process_create's kernel_ppid_spoof check for
+        where the flag actually scores.
+
+        Like ETW, the kernel event carries no CommandLine and no parent
+        image path - ParentImage/CommandLine are None so every
+        command-line-dependent rule structurally cannot fire on it."""
+        self.engine._dispatch(1, {
+            'ProcessId': pid,
+            'ParentProcessId': claimed_parent_pid,
+            'Image': image_name,
+            'ParentImage': None,
+            'CommandLine': None,
+            '_source': 'kernel',
+            '_kernel_real_creator_pid': real_creator_pid,
+            '_kernel_ppid_spoof_detected': bool(ppid_spoof_detected),
+        })
+
     def submit_sysmon(self, data_dict, create_time):
         """Sysmon's fields arrive second (richer, slower). Not dispatched
         immediately - recorded so the GC can give a same-pid ETW arrival
