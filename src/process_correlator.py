@@ -35,6 +35,46 @@ DEFAULT_FUSE_WINDOW_SECONDS = 2.0
 DEFAULT_GC_INTERVAL_SECONDS = 5
 
 
+def _normalize_pid(pid):
+    """Canonicalizes a pid to int for use as _pending's dict key and as
+    _dedup_key. Found necessary during evasion-matrix testing (reports/
+    evasion_matrix.md), one level deeper than the missing-_dedup_key bug
+    that testing also found on submit_kernel (fixed separately, below):
+    the THREE sensors hand this correlator inconsistent Python types for
+    the exact same real numeric pid.
+
+    - kernel_sensor.py's struct.unpack always gives a genuine int.
+    - HeuristicEngine.evaluate_event()'s XML parsing reads 'ProcessId'
+      straight from an ElementTree Data element's .text - always a str,
+      never cast.
+    - etw_monitor.py's pywintrace-decoded 'ProcessID' LOOKS like it should
+      be an int (tdh.py's TDH_CONVERTER_LOOKUP maps the UNSIGNEDINT out-
+      type to int()) but isn't in practice: etw.py's own conversion site
+      only calls that converter when `type(data) == int` already - a
+      no-op precondition, since TdhFormatProperty itself returns a
+      formatted str, so the "conversion" to int never actually fires.
+      Confirmed by reading etw/etw.py's _parseExtendedData in this
+      project's own .venv.
+
+    Without normalizing, int 1234 and str '1234' are different dict
+    keys - two _pending records for the SAME real process that never
+    fuse (silently reverting every process-create to two independent
+    etw-provisional + sysmon-only dispatches instead of one fused one,
+    and skipping _check_ancestry_contradiction entirely for that pid),
+    and two separate _score_once dedup buckets that never dedupe each
+    other. In practice ETW and Sysmon's values happen to both be str
+    today (so ETW/Sysmon fusion mostly still works, by accident, riding
+    on pywintrace's own bug above - fragile, not something to rely on),
+    while the kernel sensor's genuine int never matched either of them -
+    confirmed live: a kernel-observed process also matching a
+    Sysmon-only rule (e.g. staging_dir) was scored twice even after
+    submit_kernel's _dedup_key fix, because int 1234 != str '1234'."""
+    try:
+        return int(pid)
+    except (TypeError, ValueError):
+        return pid  # unparseable - preserve old (also-broken) behavior rather than guess
+
+
 class ProcessCorrelator:
     def __init__(self, engine, fuse_window=DEFAULT_FUSE_WINDOW_SECONDS, gc_interval=DEFAULT_GC_INTERVAL_SECONDS):
         self.engine = engine
@@ -49,6 +89,7 @@ class ProcessCorrelator:
         provisional finding immediately, unconditionally, so latency never
         waits on Sysmon. Also record it so a same-pid Sysmon arrival within
         fuse_window can be merged into a richer, fused dispatch by the GC."""
+        pid_key = _normalize_pid(pid)
         fields = {
             'ProcessId': pid,
             'ParentProcessId': parent_pid,
@@ -56,7 +97,7 @@ class ProcessCorrelator:
             'CreateTime': create_time,
         }
         with self._lock:
-            record = self._pending.setdefault(pid, {'etw': None, 'sysmon': None, 'first_seen': time.monotonic()})
+            record = self._pending.setdefault(pid_key, {'etw': None, 'sysmon': None, 'first_seen': time.monotonic()})
             record['etw'] = fields
 
         self.engine._dispatch(1, {
@@ -65,7 +106,7 @@ class ProcessCorrelator:
             'CommandLine': None,
             '_source': 'etw',
             '_provisional': True,
-            '_dedup_key': pid,
+            '_dedup_key': pid_key,
         })
 
     def submit_kernel(self, pid, claimed_parent_pid, real_creator_pid, image_name, ppid_spoof_detected):
@@ -84,7 +125,23 @@ class ProcessCorrelator:
 
         Like ETW, the kernel event carries no CommandLine and no parent
         image path - ParentImage/CommandLine are None so every
-        command-line-dependent rule structurally cannot fire on it."""
+        command-line-dependent rule structurally cannot fire on it.
+
+        '_dedup_key' is set to _normalize_pid(pid) - found missing
+        during evasion-matrix testing (reports/evasion_matrix.md): without it,
+        HeuristicEngine._score_once() reads a missing key as "no
+        correlator in front of this dispatch" and scores every
+        _score_once-routed check (staging_dir, defender_tamper,
+        powershell_abuse, office_lolbin) unconditionally, a SECOND time,
+        for every real process this sensor and ETW/Sysmon both observe -
+        which is the normal case for literally every process on the
+        system whenever the kernel driver is running, not an edge case.
+        Confirmed live: a single staging-dir execution was scored +30
+        twice before this fix. kernel_ppid_spoof is unaffected either
+        way - it's gated to only ever run on this dispatch, so it was
+        never double-scored, and now simply participates in the same
+        per-pid dedup bucket ETW/Sysmon already share instead of
+        bypassing it."""
         self.engine._dispatch(1, {
             'ProcessId': pid,
             'ParentProcessId': claimed_parent_pid,
@@ -94,15 +151,16 @@ class ProcessCorrelator:
             '_source': 'kernel',
             '_kernel_real_creator_pid': real_creator_pid,
             '_kernel_ppid_spoof_detected': bool(ppid_spoof_detected),
+            '_dedup_key': _normalize_pid(pid),
         })
 
     def submit_sysmon(self, data_dict, create_time):
         """Sysmon's fields arrive second (richer, slower). Not dispatched
         immediately - recorded so the GC can give a same-pid ETW arrival
         its fuse_window chance to merge first."""
-        pid = data_dict.get('ProcessId')
+        pid_key = _normalize_pid(data_dict.get('ProcessId'))
         with self._lock:
-            record = self._pending.setdefault(pid, {'etw': None, 'sysmon': None, 'first_seen': time.monotonic()})
+            record = self._pending.setdefault(pid_key, {'etw': None, 'sysmon': None, 'first_seen': time.monotonic()})
             record['sysmon'] = dict(data_dict)
             record['sysmon']['CreateTime'] = create_time
 

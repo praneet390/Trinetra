@@ -64,6 +64,38 @@ def test_submit_kernel_dispatches_immediately_with_kernel_fields():
     assert data['_kernel_ppid_spoof_detected'] is True
 
 
+def test_submit_kernel_sets_dedup_key_to_pid():
+    # Regression test for a real bug found via reports/evasion_matrix.md's
+    # live testing: submit_kernel used to omit '_dedup_key' entirely, which
+    # HeuristicEngine._score_once() reads as "no correlator in front of
+    # this dispatch, score unconditionally" - the exact opposite of what's
+    # true here. That silently double-scored every _score_once-routed
+    # check (staging_dir, defender_tamper, powershell_abuse, office_lolbin)
+    # for every real process the kernel sensor and ETW/Sysmon both observe,
+    # which is the normal case whenever the kernel driver is running, not
+    # an edge case. kernel_ppid_spoof itself was never double-scored (it's
+    # gated to only ever run on this dispatch), so this bug had no test
+    # already covering it.
+    engine = _FakeEngine()
+    correlator = pc.ProcessCorrelator(engine)
+    correlator.submit_kernel(1234, 1, 999, "evil.exe", ppid_spoof_detected=True)
+    assert engine.dispatches[0][1]['_dedup_key'] == 1234
+
+
+def test_kernel_and_etw_dispatches_for_the_same_pid_share_a_dedup_key():
+    # The actual cross-sensor guarantee the bug above broke: a kernel
+    # dispatch and an ETW dispatch for the SAME real pid must land in the
+    # same dedup bucket, the same way two etw/sysmon dispatches already do
+    # (test_both_dispatches_of_the_same_event_share_a_dedup_key above) -
+    # otherwise HeuristicEngine._score_once() can't tell they're the same
+    # real process-create event.
+    engine = _FakeEngine()
+    correlator = pc.ProcessCorrelator(engine)
+    correlator.submit_etw(1234, 1, "evil.exe", "irrelevant")
+    correlator.submit_kernel(1234, 1, 999, "evil.exe", ppid_spoof_detected=False)
+    assert engine.dispatches[0][1]['_dedup_key'] == engine.dispatches[1][1]['_dedup_key']
+
+
 def test_submit_kernel_never_merges_with_a_pending_etw_or_sysmon_record():
     # A kernel event and an ETW/Sysmon event for the SAME pid arriving close
     # together must not fuse into one record the way etw+sysmon do for each
@@ -123,6 +155,45 @@ def test_both_arrive_in_window_produces_provisional_then_fused():
     assert second[1]['_source'] == 'fused'
     assert second[1]['_provisional'] is False
     assert second[1]['CommandLine'] == 'evil.exe -x'  # fused carries Sysmon's richer fields
+
+
+def test_etw_int_pid_and_sysmon_str_pid_still_fuse():
+    # Regression test for a real bug found via reports/evasion_matrix.md's
+    # live testing, one level deeper than the submit_kernel dedup_key bug
+    # above: evaluate_event()'s real XML parsing (src/heuristic_engine.py)
+    # reads 'ProcessId' straight from an ElementTree .text node, which is
+    # ALWAYS a str - never cast to int anywhere before reaching
+    # submit_sysmon. Every other test in this file (including the one
+    # right below) passes submit_sysmon a synthetic dict with an int
+    # ProcessId, which never exercises this - int 1234 and str '1234' are
+    # different dict keys, so without normalizing, this would silently
+    # produce two independent dispatches (etw-provisional + sysmon-only)
+    # instead of one real fused one, and skip _check_ancestry_contradiction
+    # entirely. Confirmed via a direct realistic-type repro before this
+    # fix: exactly that - 2 dispatches, '_dedup_key' of mismatched types.
+    engine = _FakeEngine()
+    correlator = pc.ProcessCorrelator(engine, fuse_window=0.01)
+    correlator.submit_etw(1234, 1, "evil.exe", "irrelevant")  # realistic: int
+    correlator.submit_sysmon({'ProcessId': '1234', 'Image': 'evil.exe'}, "irrelevant")  # realistic: str
+    time.sleep(0.02)
+    correlator._gc_once()
+    sources = [d[1]['_source'] for d in engine.dispatches]
+    assert sources == ['etw', 'fused'], f"expected a real fused dispatch, got {sources}"
+    assert engine.dispatches[0][1]['_dedup_key'] == engine.dispatches[1][1]['_dedup_key']
+
+
+def test_kernel_int_pid_and_sysmon_str_pid_share_a_dedup_key():
+    # Same type mismatch as above, for the kernel sensor's always-genuine
+    # int (struct.unpack) against Sysmon's always-str (XML .text) pid.
+    engine = _FakeEngine()
+    correlator = pc.ProcessCorrelator(engine, fuse_window=0.01)
+    correlator.submit_kernel(5678, 1, 999, "evil.exe", ppid_spoof_detected=False)
+    correlator.submit_sysmon({'ProcessId': '5678', 'Image': 'evil.exe'}, "irrelevant")
+    time.sleep(0.02)
+    correlator._gc_once()
+    kernel_dispatch = next(d for d in engine.dispatches if d[1]['_source'] == 'kernel')
+    sysmon_dispatch = next(d for d in engine.dispatches if d[1]['_source'] == 'sysmon')
+    assert kernel_dispatch[1]['_dedup_key'] == sysmon_dispatch[1]['_dedup_key']
 
 
 def test_both_dispatches_of_the_same_event_share_a_dedup_key():
