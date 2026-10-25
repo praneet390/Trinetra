@@ -188,6 +188,45 @@ PROTECTED_PIDS = frozenset({0, 4})
 # running for a long time can't grow this dict without limit.
 DEDUP_MAX_ENTRIES = 2000
 
+# ---------------------------------------------------------------------------
+# Detection-forensics bounds. Both stores below follow the same bounded-
+# eviction discipline as every other buffer in this codebase - a long-lived
+# engine must never grow without limit, no matter how noisy the host is.
+# ---------------------------------------------------------------------------
+
+# Forensic ancestry snapshots (see _capture_forensic_snapshot): one per PID
+# that ever crossed the warning or critical threshold. Snapshots are
+# evidence - they are deliberately kept AFTER mitigation/death so the
+# analyst can still see the attack chain of a process that no longer exists
+# - but only the most recent ones, oldest evicted first.
+MAX_FORENSIC_SNAPSHOTS = 100
+
+# Recent process-access edges (see _handle_process_access): "which process
+# opened which OTHER process with which rights, recently". These label the
+# non-parental connection edges in a forensic snapshot - the Windows analog
+# of the ancestry graph's MMAP(RWX)-style edge: parentage says how a
+# process was BORN, an access edge says what it TOUCHED. The syscall label
+# on such an edge (see _record_access_edge) names the connection primitive
+# the granted rights imply - MMAP(RWX) for rights that allow executable
+# memory to be mapped into the victim, CREATETHREAD for remote-thread
+# injection, OpenProcess(mask) for anything less specific.
+MAX_ACCESS_EDGES = 200
+
+
+def _humanize_span(seconds):
+    """'1d 4h 12m'-style rendering for activity-span / evidence-age values.
+    Kept next to the scoring state it describes so the engine and the
+    dashboard render identical durations from identical numbers."""
+    seconds = max(0, int(seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
 
 def _parse_granted_access(raw):
     """Sysmon's GrantedAccess field as an int, or 0 if unparseable."""
@@ -206,6 +245,20 @@ def _is_dangerous_access(access_int, dangerous_bits):
     if access_int == 0:
         return False
     return access_int == PROCESS_ALL_ACCESS or bool(access_int & dangerous_bits)
+
+
+# Shared by every "is the actor a trusted OS caller" discount in this file
+# (hollowing/LSASS access, and the kernel-sourced checks below) - a single
+# definition so the four call sites can't quietly drift out of sync.
+TRUSTED_SYSTEM_PATHS = ('\\windows\\system32\\', '\\windows\\syswow64\\')
+
+
+def _is_trusted_system_path(image_path):
+    """True if `image_path` (already lowercased by the caller) resolves
+    under System32/SysWOW64 - handles both a bare NT-style path
+    ('\\windows\\system32\\...') and a drive-letter path
+    ('c:\\windows\\system32\\...')."""
+    return any(image_path.startswith(p) or f'c:{p}' in image_path for p in TRUSTED_SYSTEM_PATHS)
 
 
 class HeuristicEngine:
@@ -280,6 +333,39 @@ class HeuristicEngine:
         # so _score_once() falls through to unconditional scoring for them
         # - zero behavior change for the existing single-sensor path.
         self._recent_check_dedup = OrderedDict()
+
+        # -----------------------------------------------------------------
+        # Detection-forensics state. Everything below is ADDITIVE: it never
+        # changes what gets scored or mitigated, only what evidence is
+        # recorded about the scores the engine already produces.
+        # -----------------------------------------------------------------
+
+        # pid -> monotonic time of this PID's FIRST score contribution.
+        # Together with _last_score_time it bounds how long suspicious
+        # activity from this PID has been compounding - an evidence-derived
+        # "activity span" reported in forensic snapshots instead of a guess
+        # from log timestamps.
+        self.score_first_seen = {}
+        # Optional callable(pid) -> ancestry dict (process_tracker.py's
+        # get_ancestry). Set by the entrypoints (main.py / web_server.py)
+        # after construction, same after-the-fact wiring pattern as
+        # on_event/correlator above. The engine deliberately does not own a
+        # ProcessTracker itself: detection must keep working headless with
+        # no tracker, so _capture_forensic_snapshot degrades to an honest
+        # "ancestry unavailable" note when this is None.
+        self.ancestry_provider = None
+        # pid -> forensic snapshot (see _capture_forensic_snapshot). Taken
+        # at the moment a PID first crosses the warning or critical
+        # threshold, and deliberately retained after mitigation/death - the
+        # whole point is that the evidence outlives the process. Bounded,
+        # oldest evicted first.
+        self.forensic_snapshots = OrderedDict()
+        # actor_pid -> recent process-access edge ("this process opened that
+        # other process with these rights") - see _handle_process_access.
+        # These are the non-parental, injection-shaped edges that label WHO
+        # an actor touched, as opposed to who its parent was.
+        self._recent_access_edges = OrderedDict()
+
         logging.basicConfig(level=logging.INFO, format='[*] %(message)s')
 
     def _is_protected(self, pid):
@@ -300,7 +386,12 @@ class HeuristicEngine:
         reaching into known_good_hashes directly."""
         return file_hash in self.known_good_hashes
 
-    def add_static_score(self, file_hash, score, context):
+    def add_static_score(self, file_hash, score, context, check_id=None):
+        """Record one static finding for a sample hash. `check_id` (optional)
+        names WHICH static check contributed - it rides along on the log
+        line so a finding's origin is always attributable from the record
+        alone. The allowlist gate below still runs FIRST: a known-good hash
+        never accumulates score."""
         if file_hash in self.known_good_hashes:
             # Single choke point every static finding already routes
             # through - hardcoded rules, imphash-family matches, and
@@ -392,6 +483,69 @@ class HeuristicEngine:
         except Exception as e:
             logging.error(f"[ERROR] Handling ETW process-start event failed: {e}")
 
+    def evaluate_kernel_lsass_access(self, requestor_pid, target_pid, desired_access):
+        """Entry point for the kernel sensor's LSASS-ACCESS event
+        (driver/sensor/sensor.c's ObRegisterCallbacks observation,
+        delivered via kernel_sensor.py). Mirrors _handle_process_access's
+        existing LSASS check (same LSASS_DANGEROUS_BITS, same trusted-path
+        discount) rather than replacing it - this is an INDEPENDENT,
+        corroborating sensor, not a dedup of the Sysmon one. The two can
+        legitimately both fire for the same real attempt (that is
+        corroboration, not double-counting - see heuristic_engine's
+        general stance that independent sensors agreeing is evidence, not
+        noise) or only one can, if PPL or a missing Sysmon config stops
+        the other from ever seeing it. check_id is distinct
+        ('kernel_lsass_access') so either can be read back on its own.
+
+        Only ever called for a desired_access that already carries a
+        LSASS_DANGEROUS_BITS bit - the driver's own pre-operation callback
+        already did that filtering before this was ever queued, so no
+        re-check is needed here."""
+        try:
+            self.total_events_seen += 1
+            self.last_event_time = time.time()
+
+            try:
+                source_image = psutil.Process(requestor_pid).exe().lower()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                # Resolution failure fails CLOSED (treated as untrusted/full
+                # score) - the same posture as "can't verify, so don't
+                # discount" everywhere else safety-relevant in this engine.
+                source_image = ''
+            is_trusted_path = _is_trusted_system_path(source_image)
+
+            access_hex = f"0x{int(desired_access):x}"
+            score = 30 if is_trusted_path else 70
+            context = (
+                f"{'Trusted-path' if is_trusted_path else 'Untrusted'} process access to LSASS "
+                f"(Access: {access_hex}) - Potential credential dumping [kernel-observed]"
+            )
+            self._record_access_edge(requestor_pid, target_pid, 'lsass.exe', access_hex)
+            self._add_score(requestor_pid, score, context, check_id='kernel_lsass_access')
+        except Exception as e:
+            logging.error(f"[ERROR] Handling kernel LSASS-access event failed: {e}")
+
+    def evaluate_kernel_driver_load(self, pid, image_name, image_base):
+        """Entry point for the kernel sensor's DRIVER-LOAD event
+        (driver/sensor/sensor.c's PsSetLoadImageNotifyRoutine, filtered to
+        kernel-mode images only - see that file's header comment). A new
+        kernel driver loading mid-session is rare on an ordinary endpoint
+        and genuinely worth surfacing, but is not on its own strong enough
+        evidence to score like a confirmed technique (legitimate Windows
+        Update/Plug-and-Play driver installs are the common case) - scored
+        low, like sedebugprivilege_iat's precursor-signal weight, so it
+        compounds with other findings rather than driving mitigation alone."""
+        try:
+            self.total_events_seen += 1
+            self.last_event_time = time.time()
+            self._add_score(
+                pid, 20,
+                f"Kernel-mode driver loaded: {image_name} (base=0x{int(image_base):x}) [kernel-observed]",
+                check_id='kernel_driver_load'
+            )
+        except Exception as e:
+            logging.error(f"[ERROR] Handling kernel driver-load event failed: {e}")
+
     def _dispatch(self, event_id, data_dict):
         """Shared tail for every event source (Sysmon XML, ETW) once it's
         been normalized into a plain dict: observer hook, hardcoded
@@ -432,7 +586,10 @@ class HeuristicEngine:
         rule_engine.py) use this to avoid inflating a count on a
         deduped-away second dispatch of the same real event."""
         if dedup_key is None:
-            self._add_score(pid, score, context)
+            # Plain single-sensor dispatch: transparent pass-through. The
+            # check_id rides along so the log line always names the check
+            # that produced the points.
+            self._add_score(pid, score, context, check_id=check_id)
             return True
 
         if dedup_key not in self._recent_check_dedup:
@@ -447,10 +604,15 @@ class HeuristicEngine:
             logging.info(f"[DEDUP] Skipping duplicate '{check_id}' for PID {pid} - already scored by an earlier dispatch of this same event")
             return False
         seen.add(check_id)
-        self._add_score(pid, score, context)
+        self._add_score(pid, score, context, check_id=check_id)
         return True
 
-    def _add_score(self, pid, score, context):
+    def _add_score(self, pid, score, context, check_id=None):
+        """The single choke point every per-PID behavioral finding flows
+        through. `check_id` (optional) names the contributing check - all
+        internal callers pass one so the log line always shows which rule
+        produced the points, and None degrades gracefully for any future
+        caller that doesn't."""
         if self._is_protected(pid):
             # Never even accumulate score for a protected process - no
             # heuristic gets to push this PID toward mitigate(), full stop.
@@ -462,6 +624,12 @@ class HeuristicEngine:
 
         if pid not in self.process_scores:
             self.process_scores[pid] = 0
+        # Anchor the activity span on the FIRST contribution this PID ever
+        # made - 'how long has this been going on' is evidence, derived
+        # here from the same clock the scoring itself uses (monotonic, so
+        # wall-clock adjustments can't bend it).
+        if pid not in self.score_first_seen:
+            self.score_first_seen[pid] = time.monotonic()
 
         self.process_scores[pid] += score
         self._last_score_time[pid] = time.monotonic()
@@ -496,6 +664,13 @@ class HeuristicEngine:
         last_start = self._pid_start_times.get(pid)
         if last_start is not None and last_start != current_start:
             self.process_scores[pid] = 0
+            # The old process's forensic state is not this process's: its
+            # activity-span anchor describes a process that no longer
+            # exists. (Forensic SNAPSHOTS are deliberately NOT cleared
+            # here - they are evidence about the past, and overwriting one
+            # only happens if the new process also crosses a threshold, at
+            # which point the newer evidence wins.)
+            self.score_first_seen.pop(pid, None)
         self._pid_start_times[pid] = current_start
 
     def _check_threshold(self, pid):
@@ -503,11 +678,190 @@ class HeuristicEngine:
         critical = self.config['thresholds']['critical']
         warning = self.config['thresholds']['warning']
         if score >= critical:
+            # Forensic snapshot BEFORE any mitigation action: at the moment
+            # of detection the ancestry is captured once, automatically,
+            # with no analyst effort - and it stays even after the process
+            # is terminated and gone (see _capture_forensic_snapshot).
+            self._capture_forensic_snapshot(pid, 'critical_threshold', score)
             logging.warning(f"[CRITICAL THREAT] PID {pid} crossed mitigation threshold (Score {score}). Mitigating...")
             self.mitigate(pid)
             self.process_scores[pid] = 0 # reset after mitigation
+            # The just-mitigated process is gone; its live activity anchor
+            # describes something that can no longer accumulate. The
+            # forensic snapshot above deliberately survives this cleanup -
+            # that is the evidence copy.
+            self.score_first_seen.pop(pid, None)
         elif score >= warning:
+            # Same snapshot at the warning tier - a warning is the analyst's
+            # first look at this PID, and the chain should already be there
+            # when they look. _capture_forensic_snapshot only records the
+            # FIRST snapshot per PID, so an escalating PID (warning ->
+            # critical) keeps its earliest chain and the critical tier adds
+            # the mitigation record on top, it does not silently overwrite.
+            self._capture_forensic_snapshot(pid, 'warning_threshold', score)
             logging.warning(f"[WARNING] PID {pid} score >= {warning}. Taking memory snapshot... (Simulated)")
+
+    def _capture_forensic_snapshot(self, pid, trigger, score):
+        """Capture the Memory Ancestry Graph evidence for `pid` at the
+        moment of detection: the full process ancestry (PID, PPID, command
+        line, user, spawn time per ancestor - and environment variables for
+        still-alive ancestors when a provider is wired), parent->child
+        edges labeled with the syscall family that created each link
+        (EXEC), and any recent process-ACCESS edge this PID originated
+        (the injection-shaped 'who it touched' connection, syscall-labeled
+        MMAP(RWX)/CREATETHREAD from the granted rights - see
+        _record_access_edge).
+
+        Deliberate behaviors:
+        - ONE snapshot per PID: the first threshold crossing wins. An
+          escalating PID (warning -> critical) keeps its earliest chain;
+          the analyst sees the chain as it stood when the alert was born,
+          not a rewritable record. Re-capture only happens for a NEW PID
+          (or after eviction of the old snapshot).
+        - Snapshots outlive the process on purpose: by the time a human
+          opens the alert, mitigate() may long since have terminated it,
+          and the ancestry of a dead process is unrecoverable from psutil.
+        - ancestry_provider being None (headless CLI without a tracker) is
+          not an error: the snapshot still records score/trigger/span and
+          an explicit 'ancestry unavailable' note, so evidence is never
+          silently absent.
+        - The trigger_edge (process-access connection) is attached only
+          when it actually involves this PID as the actor - the ancestry
+          walk describes how the process was BORN, the access edge
+          describes what it TOUCHED; neither claims to be the other. When
+          present, the access edge is ALSO merged into the ancestry's edge
+          list (kind='access') so the complete reconstructed attack chain
+          - births AND injections - is one graph, not two artifacts.
+        """
+        if pid in self.forensic_snapshots:
+            return
+
+        ancestry = None
+        ancestry_note = None
+        if self.ancestry_provider is not None:
+            try:
+                ancestry = self.ancestry_provider(pid)
+                if ancestry is None:
+                    ancestry_note = ('process itself was never observed by the lineage tracker - '
+                                     'ancestry cannot be reconstructed for this PID')
+            except Exception as e:
+                # An observer's bug must never break detection or mitigation:
+                # degrade to an honest note, exactly like on_event does.
+                ancestry = None
+                ancestry_note = f'ancestry provider failed ({e.__class__.__name__})'
+        else:
+            ancestry_note = 'no lineage tracker wired into this entrypoint'
+
+        trigger_edge = self._access_edge_for(pid)
+        first_seen = self.score_first_seen.get(pid)
+        activity_span = (time.monotonic() - first_seen) if first_seen is not None else None
+        if isinstance(ancestry, dict):
+            try:
+                chain_summary = self._chain_summary_from_ancestry(ancestry)
+            except Exception:
+                chain_summary = None
+            # Merge the access edge into the ancestry graph when this PID
+            # both has a chain and TOUCHED another process: the graph then
+            # reads as the complete attack chain (birth edges + the
+            # injection edge), which is the whole point of capturing it
+            # automatically at detection time. The edge keeps kind='access'
+            # so consumers can tell it apart from parentage ('EXEC') edges
+            # and render/weight it accordingly - never silently as
+            # parentage.
+            if trigger_edge is not None:
+                merged = dict(trigger_edge)
+                merged['kind'] = 'access'
+                ancestry.setdefault('edges', []).append(merged)
+        else:
+            chain_summary = None
+
+        snapshot = {
+            'pid': pid,
+            'taken_at': time.time(),
+            'trigger': trigger,
+            'score_at_capture': round(score, 1),
+            'activity_span_seconds': round(activity_span, 1) if activity_span is not None else None,
+            'activity_span_human': _humanize_span(activity_span) if activity_span is not None else None,
+            'chain_summary': chain_summary,
+            'ancestry': ancestry,
+            'ancestry_note': ancestry_note,
+            'trigger_edge': trigger_edge,
+        }
+        self.forensic_snapshots[pid] = snapshot
+        self.forensic_snapshots.move_to_end(pid)
+        while len(self.forensic_snapshots) > MAX_FORENSIC_SNAPSHOTS:
+            self.forensic_snapshots.popitem(last=False)
+
+        # The forensic log line IS an alert (AlertStore ingests it), so it
+        # must carry the complete reconstruction itself: chain + the
+        # syscall-labeled connection edge, requiring zero analyst effort
+        # and zero extra queries to read the attack chain.
+        edge_note = ''
+        if trigger_edge is not None:
+            target_text = trigger_edge.get('target_image') or f"pid {trigger_edge.get('to')}"
+            edge_note = f" | connection edge: {trigger_edge.get('syscall')} -> {target_text}"
+        logging.warning(
+            f"[FORENSIC] PID {pid} ancestry captured at {trigger} "
+            f"(chain: {chain_summary or 'unavailable'}){edge_note}"
+        )
+
+    @staticmethod
+    def _chain_summary_from_ancestry(ancestry):
+        """'a.exe -> b.exe -> evil.exe'-style one-liner from an ancestry dict
+        (the structure process_tracker.get_ancestry returns). Uses the same
+        dual-separator basename logic as the tracker so Windows paths render
+        correctly regardless of host OS."""
+        def _short(path_or_name):
+            if not isinstance(path_or_name, str):
+                return str(path_or_name)
+            return path_or_name.replace('\\', '/').rsplit('/', 1)[-1]
+        names = [_short(node.get('image') or f"pid:{node.get('pid')}") for node in ancestry.get('nodes', [])]
+        summary = ' -> '.join(names)
+        if ancestry.get('incomplete'):
+            summary += ' (partial)'
+        return summary
+
+    def _record_access_edge(self, actor_pid, target_pid, target_image, granted_access_raw):
+        """Remember one process-access connection (actor -> target with the
+        granted rights mask) so a later forensic snapshot for the actor can
+        label the injection-shaped edge.
+
+        The edge carries TWO labels:
+        - 'label': the raw observation, OpenProcess(<mask>) - what Sysmon
+          literally recorded.
+        - 'syscall': the connection primitive the mask implies, in the
+          ancestry graph's syscall-label vocabulary:
+            MMAP(RWX)    - the mask lets the actor map/write executable
+                           memory into the victim (VM_WRITE or
+                           ALL_ACCESS; the Windows analog of mmap'ing a
+                           RWX page into another process's space).
+            CREATETHREAD - remote-thread injection capability (the
+                           CreateRemoteThread primitive) without an
+                           accompanying write right.
+            OpenProcess(mask) - the mask alone implies nothing injective.
+        Bounded LRU, same as every other engine store."""
+        access_int = _parse_granted_access(granted_access_raw)
+        if access_int == PROCESS_ALL_ACCESS or (access_int & PROCESS_VM_WRITE):
+            syscall_label = 'MMAP(RWX)'
+        elif access_int & PROCESS_CREATE_THREAD:
+            syscall_label = 'CREATETHREAD'
+        else:
+            syscall_label = f'OpenProcess({granted_access_raw})' if granted_access_raw else 'OpenProcess'
+        self._recent_access_edges[actor_pid] = {
+            'from': actor_pid,
+            'to': target_pid,
+            'target_image': target_image,
+            'label': f'OpenProcess({granted_access_raw})' if granted_access_raw else 'OpenProcess',
+            'syscall': syscall_label,
+            'ts': time.time(),
+        }
+        self._recent_access_edges.move_to_end(actor_pid)
+        while len(self._recent_access_edges) > MAX_ACCESS_EDGES:
+            self._recent_access_edges.popitem(last=False)
+
+    def _access_edge_for(self, pid):
+        """The most recent access edge this PID originated, or None."""
+        return self._recent_access_edges.get(pid)
 
     def _handle_process_create(self, data):
         # Event ID 1: Flag execution from staging directories
@@ -518,6 +872,54 @@ class HeuristicEngine:
         original_name = (data.get('OriginalFileName') or '').lower()
         dedup_key = data.get('_dedup_key')
         child_name = os.path.basename(image)
+
+        # Kernel-verified PPID spoofing (driver/sensor/sensor.c's PROC-CREATE
+        # event, routed here via process_correlator.submit_kernel). Sysmon/
+        # ETW's ParentProcessId is only ever a CLAIM - a caller can legally
+        # set it to any running process via PROC_THREAD_ATTRIBUTE_PARENT_
+        # PROCESS, and neither of those two sensors can see past that. The
+        # kernel driver can: it reads the real creator from
+        # PsSetCreateProcessNotifyRoutineEx's CreatingThreadId field, which
+        # that attribute cannot influence. This is a fundamentally stronger
+        # signal than the existing [TELEMETRY_CONTRADICTION] log (which only
+        # proves Sysmon and ETW disagree with EACH OTHER about the claim,
+        # never whether the claim itself is true).
+        #
+        # It does, however, have a real false-positive path the kernel-
+        # ground-truth framing above doesn't fully cover: Windows' own
+        # packaged-app/COM activation infrastructure (RuntimeBroker.exe,
+        # a DcomLaunch-hosted svchost.exe, a dllhost.exe COM surrogate,
+        # explorer.exe) legitimately uses PROC_THREAD_ATTRIBUTE_PARENT_
+        # PROCESS to reparent a child for taskbar/Alt-Tab grouping - not to
+        # hide anything. Live-fire testing confirmed this at full severity:
+        # a single run auto-killed real Outlook processes (olk.exe,
+        # olkFullTrustExecutor.exe) three times, every one of them actually
+        # created by the SAME broker PID across different claimed parents -
+        # exactly that signature, not an attack. So this is scored like the
+        # hollowing/LSASS access checks above: full severity (crosses the
+        # critical threshold alone) when the real creator can't be verified
+        # as one of those trusted OS brokers, discounted to a precursor-
+        # signal weight (same tier as kernel_driver_load) when it can - an
+        # actual spoofing attack's real creator (the malware/dropper itself)
+        # will essentially never resolve to System32/SysWOW64.
+        if data.get('_source') == 'kernel' and data.get('_kernel_ppid_spoof_detected'):
+            real_creator = data.get('_kernel_real_creator_pid')
+            claimed_parent = data.get('ParentProcessId')
+            try:
+                creator_image = psutil.Process(int(real_creator)).exe().lower()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, TypeError, ValueError):
+                creator_image = ''  # can't verify -> fails closed (untrusted/full score)
+            is_trusted_creator = _is_trusted_system_path(creator_image)
+            score = 20 if is_trusted_creator else 80
+            context = (
+                f"{'Trusted-broker' if is_trusted_creator else 'Kernel-verified'} PPID spoofing: process "
+                f"claims parent PID {claimed_parent} but was actually created by PID {real_creator} "
+                f"(PROC_THREAD_ATTRIBUTE_PARENT_PROCESS or equivalent) - unspoofable kernel ground truth, "
+                f"not a cross-sensor inference"
+                + (" (real creator resolves to a trusted System32/SysWOW64 broker - likely benign "
+                   "packaged-app/COM activation reparenting, not an attack)" if is_trusted_creator else "")
+            )
+            self._score_once(dedup_key, 'kernel_ppid_spoof', pid, score, context)
 
         if 'temp' in image or 'users\\public' in image:
             self._score_once(dedup_key, 'staging_dir', pid, 30, f"Execution from staging directory: {image}")
@@ -544,8 +946,7 @@ class HeuristicEngine:
         granted_access = data.get('GrantedAccess', '').lower()
 
         access_int = _parse_granted_access(granted_access)
-        trusted_callers = ('\\windows\\system32\\', '\\windows\\syswow64\\')
-        is_trusted_path = any(source_image.startswith(p) or f'c:{p}' in source_image for p in trusted_callers)
+        is_trusted_path = _is_trusted_system_path(source_image)
 
         if 'svchost.exe' in target_image and _is_dangerous_access(access_int, HOLLOWING_DANGEROUS_BITS):
             # Signed System32 tools (SCM, WMI, admin utilities) routinely
@@ -553,7 +954,12 @@ class HeuristicEngine:
             # reasons - only score at full severity for untrusted sources.
             score = 15 if is_trusted_path else 50
             context = f"{'Trusted-path' if is_trusted_path else 'Untrusted'} access to {target_image} (Access: {granted_access}) - Potential Process Hollowing"
-            self._add_score(source_pid, score, context)
+            # The access mask itself becomes an ancestry-graph edge label:
+            # "actor opened svchost with THESE rights" is the Windows analog
+            # of the classic MMAP(RWX) edge - how a tool connected to its
+            # victim, as opposed to how the tool was born.
+            self._record_access_edge(source_pid, int(data.get('TargetProcessId', 0) or 0), target_image, granted_access)
+            self._add_score(source_pid, score, context, check_id='hollowing_access')
 
         # LSASS credential-access detection, modeled on Fibratus's
         # credential_access_suspicious_lsass_process_access /
@@ -570,7 +976,10 @@ class HeuristicEngine:
             # of the well-known OS/AV callers, to keep false positives down.
             score = 30 if is_trusted_path else 70
             context = f"{'Trusted-path' if is_trusted_path else 'Untrusted'} process access to LSASS (Access: {granted_access}) - Potential credential dumping"
-            self._add_score(source_pid, score, context)
+            # Same edge-labeling as the hollowing rule above: the access
+            # mask is the label on the actor->victim connection.
+            self._record_access_edge(source_pid, int(data.get('TargetProcessId', 0) or 0), target_image, granted_access)
+            self._add_score(source_pid, score, context, check_id='lsass_access')
 
     def _handle_file_create(self, data):
         # Event ID 11: Ransomware-style rate detector - a burst of file
@@ -608,7 +1017,8 @@ class HeuristicEngine:
             self._add_score(
                 pid, 80,
                 f"{len(timestamps)} file creates/renames in {window_seconds}s - "
-                f"potential mass encryption (ransomware)"
+                f"potential mass encryption (ransomware)",
+                check_id='ransomware_burst'
             )
 
     def _handle_registry_event(self, data):
@@ -617,7 +1027,7 @@ class HeuristicEngine:
         target_obj = data.get('TargetObject', '').lower()
         
         if '\\currentversion\\run' in target_obj:
-            self._add_score(pid, 40, f"Persistence attempt in Run key: {target_obj}")
+            self._add_score(pid, 40, f"Persistence attempt in Run key: {target_obj}", check_id='run_key_persistence')
 
     def mitigate(self, pid):
         # Last-resort, unconditional refusal - deliberately redundant with
@@ -628,6 +1038,13 @@ class HeuristicEngine:
         if pid in PROTECTED_PIDS or pid == self._own_pid:
             logging.critical(f"[REFUSED] Refusing to mitigate PID {pid} - protected system PID. Manual review required.")
             return
+
+        # A direct mitigation request (e.g. the dashboard's Terminate
+        # button) must also produce ancestry evidence: this capture runs
+        # before anything is suspended, and no-ops if the threshold path
+        # already snapshotted this PID (one snapshot per PID, first wins -
+        # a manual request for an already-flagged process adds nothing).
+        self._capture_forensic_snapshot(pid, 'mitigation_requested', self.process_scores.get(pid, 0))
 
         try:
             proc = psutil.Process(pid)

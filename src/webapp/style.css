@@ -239,10 +239,13 @@ tbody tr:hover { background: var(--panel-2); }
 /* Process Explorer source column - which sensor(s) produced this row. See
    process_correlator.py: 'etw' is provisional (thin fields, arrived first),
    'fused' merged in Sysmon's richer fields shortly after, 'sysmon' is the
-   pre-correlator/single-sensor default. */
+   pre-correlator/single-sensor default, 'kernel' is driver-verified
+   ancestry (see kernel_sensor.py) - ground truth, not a claimed field, so
+   it gets the strongest treatment of the four. */
 .src-etw { color: var(--warning); }
 .src-fused { color: var(--accent); font-weight: 600; }
 .src-sysmon { color: var(--muted); }
+.src-kernel { color: var(--ok); font-weight: 600; }
 .sev-INFO { color: var(--info); }
 
 .empty-row td { color: var(--muted); text-align: center; padding: 22px; font-family: "Segoe UI", sans-serif; }
@@ -257,3 +260,93 @@ tbody tr:hover { background: var(--panel-2); }
   font-size: 11px;
   line-height: 1.6;
 }
+
+/* ---- detection-forensics modal (Live / Chain) ----------------------------
+   One shared modal shell; opened by the per-row buttons in the Endpoint
+   Processes table. Backdrop dims the page; the panel itself is a floating
+   card on the same dark palette as the rest of the dashboard. */
+.modal-backdrop {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(4, 10, 16, 0.72);
+  z-index: 100;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 48px 16px;
+  overflow-y: auto;
+}
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  width: 100%;
+  max-width: 760px;
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.55);
+}
+.modal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.modal-head h3 { margin: 0; font-size: 14px; color: var(--fg-strong); }
+.modal-body { padding: 14px 18px 18px; }
+.modal-note { color: var(--muted); font-size: 11.5px; margin: 6px 0; line-height: 1.5; }
+.modal-h4 { margin: 14px 0 6px; font-size: 12px; color: var(--fg-strong); text-transform: uppercase; letter-spacing: 0.04em; }
+
+.kv-row { display: flex; gap: 10px; padding: 3px 0; font-size: 12px; }
+.kv-label { color: var(--muted); min-width: 180px; flex-shrink: 0; }
+.kv-value { color: var(--fg); font-family: var(--mono); word-break: break-all; }
+
+/* Live Process Status + Memory Ancestry snapshot box (shared card shape). */
+.live-head, .snap-box {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 10px;
+  background: var(--panel-2);
+}
+.live-head { display: flex; flex-wrap: wrap; gap: 4px 22px; align-items: center; }
+
+/* HANDS-ON THREAT: the orange banner classification for Cobalt Strike
+   stager detections (see hands_on.py / web_server.AlertStore). Pinned to
+   the top of the Detections queue server-side; these styles make the row
+   impossible to mistake for a generic finding - orange left rail + tinted
+   background on the row, and a filled orange chip ahead of the message. */
+tr.hands-on-row td { background: rgba(184, 92, 11, 0.18); }
+tr.hands-on-row td:first-child { box-shadow: inset 3px 0 0 #c26a10; }
+.hands-on-chip {
+  display: inline-block;
+  background: #c26a10;
+  color: #fff4e8;
+  font-weight: 700;
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  padding: 2px 8px;
+  border-radius: 4px;
+  margin-right: 6px;
+  vertical-align: 1px;
+}
+
+/* Live Process Status lists (open files, connections, env excerpts). */
+.live-list { margin: 4px 0 8px; padding-left: 20px; color: var(--fg); font-size: 12px; line-height: 1.6; }
+.live-list.mono { font-family: var(--mono); font-size: 11.5px; word-break: break-all; }
+.env-list { max-height: 180px; overflow-y: auto; }
+
+/* Memory Ancestry chain: nodes indented per generation, edge label inline
+   before each child (—[EXEC]→ evil.exe). */
+.chain-tree { margin-top: 10px; }
+.chain-node {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin: 8px 0;
+  background: var(--panel-2);
+}
+.chain-title { display: flex; flex-wrap: wrap; gap: 10px; align-items: baseline; }
+.chain-image { color: var(--fg-strong); font-family: var(--mono); font-weight: 600; font-size: 12.5px; word-break: break-all; }
+.chain-pid { color: var(--muted); font-family: var(--mono); font-size: 11px; white-space: nowrap; }
+.chain-details { margin-top: 6px; }

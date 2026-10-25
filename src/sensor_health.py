@@ -1,8 +1,12 @@
 """
-Passive liveness tracking for the two independent telemetry sensors
-(Sysmon, ETW) - each sensor's start_monitor()/start_etw_monitor() calls
-touch() every time it actually delivers an event, so a dead/tampered
-sensor is visibly distinguishable from one that's merely quiet.
+Passive liveness tracking for the independent telemetry sensors (Sysmon,
+ETW, and the kernel driver sensor - see kernel_sensor.py) - each sensor's
+start_monitor()/start_etw_monitor()/start_kernel_monitor() calls touch()
+every time it actually delivers an event, so a dead/tampered sensor is
+visibly distinguishable from one that's merely quiet. This module is
+itself sensor-count-agnostic (every function below takes an arbitrary
+list of sensors/handles) - it was written for two and didn't need a
+single change to support the third.
 
 Deliberately observe-only: this watchdog logs staleness transitions and
 exposes them to the dashboard, it never tries to restart a dead sensor.
@@ -12,7 +16,7 @@ against genuine sensor death - both beyond what a non-elevated dev shell
 can responsibly exercise. Auto-restart is a deliberate, separate follow-on.
 
 Also derives one aggregate "blind state" (HEALTHY/DEGRADED/PARTIALLY_BLIND/
-CRITICALLY_BLIND) from the two sensors' liveness - the point isn't "is the
+CRITICALLY_BLIND) from every sensor's liveness - the point isn't "is the
 watchdog thread alive" (it always is, once started), it's "how much of the
 endpoint's behavioral telemetry can currently be trusted." Detection logic
 should treat a lack of alerts differently depending on this state: silence

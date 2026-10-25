@@ -272,6 +272,18 @@ def test_normalize_command_line():
     assert he._normalize_command_line("  padded  ") == "padded"
 
 
+def test_is_trusted_system_path():
+    # Shared by the hollowing/LSASS access checks and the kernel-sourced
+    # checks (kernel_lsass_access, kernel_ppid_spoof) - handles both a
+    # drive-letter path and the bare NT-style path ETW/Sysmon sometimes hand
+    # back, same as test_defender_tamper_host_match_is_case_insensitive_
+    # and_path_agnostic proves for the (separate) Defender-tamper host gate.
+    assert he._is_trusted_system_path(r"c:\windows\system32\runtimebroker.exe")
+    assert he._is_trusted_system_path(r"\windows\syswow64\dllhost.exe")
+    assert not he._is_trusted_system_path(r"c:\users\bob\appdata\local\temp\evil.exe")
+    assert not he._is_trusted_system_path("")
+
+
 def test_defender_tamper_still_respects_the_protected_floor():
     # The two-layer safety floor must hold for the tamper rule too: the
     # agent's own PID is never scored, so mitigate() is never reached.
@@ -664,6 +676,187 @@ def test_evaluate_etw_process_start_never_raises_on_bad_input():
     engine.evaluate_etw_process_start(None, parent_pid=None, image_name=None)  # must not raise
 
 
+# ---- evaluate_kernel_lsass_access (kernel driver sensor) ------------------
+# Mirrors the Sysmon/ETW LSASS check (test_lsass_*) above, same scores and
+# same trusted-path discount - but the kernel sensor only ever hands us a
+# PID (sensor.c has no image-path lookup of its own), so this resolves the
+# source image itself via psutil, unlike the Sysmon/ETW path which already
+# has SourceImage on the event. See heuristic_engine.py's own docstring for
+# why resolution failure fails closed (treated as untrusted).
+
+def _fake_resolvable_process(exe_path):
+    # Stubs exe() (what evaluate_kernel_lsass_access itself resolves),
+    # plus name()/create_time() - _add_score's own protected-floor check
+    # (_is_protected) and PID-reuse guard (_reset_score_if_pid_reused) call
+    # psutil.Process(pid) again independently, so the fake must satisfy all
+    # three or they raise AttributeError (caught by evaluate_kernel_lsass_
+    # access's own broad except, silently dropping the score - this is
+    # exactly the bug the counts-toward-heartbeat/scores tests below would
+    # otherwise mask).
+    return type("F", (), {
+        "exe": lambda self: exe_path,
+        "name": lambda self: "mimikatz.exe",  # not in PROTECTED_PROCESS_NAMES
+        "create_time": lambda self: 100.0,
+    })()
+
+
+def test_evaluate_kernel_lsass_access_untrusted_source_scores_full():
+    engine = HeuristicEngine()
+    pid = fresh_pid()
+    original = he.psutil.Process
+    he.psutil.Process = lambda p: _fake_resolvable_process(r"C:\Users\bob\AppData\Local\Temp\mimikatz.exe")
+    try:
+        engine.evaluate_kernel_lsass_access(pid, target_pid=700, desired_access=0x1010)
+    finally:
+        he.psutil.Process = original
+    assert engine.process_scores[pid] == 70
+
+
+def test_evaluate_kernel_lsass_access_trusted_path_source_scores_reduced():
+    engine = HeuristicEngine()
+    pid = fresh_pid()
+    original = he.psutil.Process
+    he.psutil.Process = lambda p: _fake_resolvable_process(r"C:\Windows\System32\taskmgr.exe")
+    try:
+        engine.evaluate_kernel_lsass_access(pid, target_pid=700, desired_access=0x1010)
+    finally:
+        he.psutil.Process = original
+    assert engine.process_scores[pid] == 30
+
+
+def test_evaluate_kernel_lsass_access_resolution_failure_fails_closed():
+    # Can't resolve the requestor's own image path (already exited, access
+    # denied, etc.) - must score as untrusted (full), not silently drop the
+    # finding or assume trusted.
+    engine = HeuristicEngine()
+    pid = fresh_pid()
+    original = he.psutil.Process
+    def _raise_no_such_process(p):
+        raise psutil.NoSuchProcess(p)
+    he.psutil.Process = _raise_no_such_process
+    try:
+        engine.evaluate_kernel_lsass_access(pid, target_pid=700, desired_access=0x1010)
+    finally:
+        he.psutil.Process = original
+    assert engine.process_scores[pid] == 70
+
+
+def test_evaluate_kernel_lsass_access_counts_toward_heartbeat():
+    engine = HeuristicEngine()
+    before = engine.total_events_seen
+    engine.evaluate_kernel_lsass_access(fresh_pid(), target_pid=700, desired_access=0x1010)
+    assert engine.total_events_seen == before + 1
+    assert engine.last_event_time is not None
+
+
+def test_evaluate_kernel_lsass_access_respects_protected_floor():
+    engine = HeuristicEngine()
+    engine.evaluate_kernel_lsass_access(4, target_pid=700, desired_access=0x1010)  # PID 4 = System
+    assert 4 not in engine.process_scores
+
+
+def test_evaluate_kernel_lsass_access_never_raises_on_bad_input():
+    engine = HeuristicEngine()
+    engine.evaluate_kernel_lsass_access(None, target_pid=None, desired_access=None)  # must not raise
+
+
+# ---- evaluate_kernel_driver_load (kernel driver sensor) -------------------
+
+def test_evaluate_kernel_driver_load_scores_low():
+    # Low, precursor-signal weight (see the method's own docstring) - a new
+    # kernel driver loading is not on its own strong enough to mitigate.
+    engine = HeuristicEngine()
+    pid = fresh_pid()
+    engine.evaluate_kernel_driver_load(pid, image_name="evil.sys", image_base=0xFFFFF80000000000)
+    assert engine.process_scores[pid] == 20
+
+
+def test_evaluate_kernel_driver_load_counts_toward_heartbeat():
+    engine = HeuristicEngine()
+    before = engine.total_events_seen
+    engine.evaluate_kernel_driver_load(fresh_pid(), image_name="ok.sys", image_base=0x1000)
+    assert engine.total_events_seen == before + 1
+    assert engine.last_event_time is not None
+
+
+def test_evaluate_kernel_driver_load_never_raises_on_bad_input():
+    engine = HeuristicEngine()
+    engine.evaluate_kernel_driver_load(None, image_name=None, image_base=None)  # must not raise
+
+
+# ---- kernel-verified PPID spoofing (_handle_process_create) ---------------
+# Routed here by process_correlator.submit_kernel - see its own docstring
+# for why this is dispatched independently rather than fused with Sysmon/
+# ETW's own (spoofable) ParentProcessId claim.
+
+def _handle_kernel_ppid_spoof(pid, real_creator_pid, resolved_creator_exe=None,
+                               creator_resolution_raises=False):
+    """Drives _handle_process_create's kernel_ppid_spoof branch with the
+    real creator's psutil.Process().exe() resolution under test control -
+    mirrors the he.psutil.Process monkeypatch pattern used throughout this
+    file (e.g. test_evaluate_kernel_lsass_access_trusted_path_source_
+    scores_reduced)."""
+    engine = HeuristicEngine()
+    original = he.psutil.Process
+    if creator_resolution_raises:
+        def _raise(p):
+            raise psutil.NoSuchProcess(p)
+        he.psutil.Process = _raise
+    else:
+        he.psutil.Process = lambda p: _fake_resolvable_process(resolved_creator_exe)
+    try:
+        engine._handle_process_create({
+            'ProcessId': pid, 'ParentProcessId': 1, 'Image': 'evil.exe',
+            'ParentImage': None, 'CommandLine': None, '_source': 'kernel',
+            '_kernel_real_creator_pid': real_creator_pid, '_kernel_ppid_spoof_detected': True,
+        })
+    finally:
+        he.psutil.Process = original
+    return engine
+
+
+def test_kernel_ppid_spoof_scores_and_crosses_critical_threshold():
+    # Real creator doesn't resolve to a trusted System32/SysWOW64 broker -
+    # fails closed to full severity. +80 alone crosses the >=80 mitigation
+    # threshold in one shot, reset to 0 - same designed outcome as
+    # test_defender_tamper_command_line above.
+    pid = fresh_pid()
+    engine = _handle_kernel_ppid_spoof(pid, fresh_pid(), r"C:\Users\bob\AppData\Local\Temp\dropper.exe")
+    assert engine.process_scores[pid] == 0
+
+
+def test_kernel_ppid_spoof_discounted_for_a_trusted_broker_real_creator():
+    # Regression test for the exact false positive live-fire testing
+    # surfaced: RuntimeBroker.exe (and other System32/SysWOW64 reparenting
+    # infrastructure) legitimately uses PROC_THREAD_ATTRIBUTE_PARENT_PROCESS
+    # for taskbar/Alt-Tab grouping - must not auto-mitigate real
+    # applications (it killed live Outlook processes three times before
+    # this discount existed).
+    pid = fresh_pid()
+    engine = _handle_kernel_ppid_spoof(pid, fresh_pid(), r"C:\Windows\System32\RuntimeBroker.exe")
+    assert engine.process_scores[pid] == 20, "trusted broker must discount to the precursor-signal weight, not auto-mitigate"
+
+
+def test_kernel_ppid_spoof_resolution_failure_fails_closed():
+    # Can't resolve the real creator's image at all (already exited, access
+    # denied) - must score as untrusted/full severity, the same "can't
+    # verify, so don't discount" posture as everywhere else in this engine.
+    pid = fresh_pid()
+    engine = _handle_kernel_ppid_spoof(pid, fresh_pid(), creator_resolution_raises=True)
+    assert engine.process_scores[pid] == 0  # +80 crosses critical, same as the untrusted case
+
+
+def test_kernel_ppid_spoof_not_flagged_when_driver_reports_no_mismatch():
+    engine = HeuristicEngine()
+    pid = fresh_pid()
+    engine._handle_process_create({
+        'ProcessId': pid, 'ParentProcessId': 1, 'Image': r'C:\Windows\System32\notepad.exe',
+        'ParentImage': None, 'CommandLine': None, '_source': 'kernel',
+        '_kernel_real_creator_pid': 1, '_kernel_ppid_spoof_detected': False,
+    })
+    assert pid not in engine.process_scores
+
+
 # ---- _dispatch regression: evaluate_event behavior is unchanged -----------
 
 def test_dispatch_extraction_preserves_evaluate_event_behavior():
@@ -752,6 +945,186 @@ def test_handle_process_create_dedup_end_to_end():
     engine._handle_process_create(fused)
     # staging_dir (30) once + powershell_abuse (45) once = 75, NOT 30+30+45
     assert abs(engine.process_scores[pid] - 75) < 0.01
+
+
+# ---- Alert-time evidence: activity anchor lifecycle ------------------------
+
+def test_activity_anchor_cleared_on_pid_reuse():
+    engine = HeuristicEngine()
+    pid = fresh_pid()
+    engine._add_score(pid, 30, 'staging dir', check_id='staging_dir')
+    # Simulate the OS handing this PID to a different process.
+    real_create = psutil.Process
+    class _NewProc:
+        @staticmethod
+        def create_time():
+            return 1.5
+    psutil.Process = lambda p: _NewProc()
+    try:
+        engine._pid_start_times[pid] = 0.0  # different start time -> reuse
+        engine._reset_score_if_pid_reused(pid)
+        assert pid not in engine.score_first_seen
+    finally:
+        psutil.Process = real_create
+
+
+def test_activity_anchor_cleared_after_mitigation_snapshot_survives():
+    engine = HeuristicEngine()
+    pid = fresh_pid()
+    engine._add_score(pid, 90, 'Defender tampering', check_id='defender_tamper')
+    # +90 crossed critical: snapshot taken, mitigation no-ops on the fake
+    # PID, live state cleared, forensic evidence retained.
+    assert pid in engine.forensic_snapshots
+    snapshot = engine.forensic_snapshots[pid]
+    assert snapshot['trigger'] == 'critical_threshold'
+    assert snapshot['score_at_capture'] == 90
+    assert pid not in engine.score_first_seen
+
+
+# ---- Memory Ancestry Graph: detection-time forensic snapshots --------------
+
+def _fake_ancestry(pid):
+    return {
+        'pid': pid,
+        'nodes': [
+            {'pid': 1, 'ppid': None, 'image': r'C:\Windows\explorer.exe', 'command_line': None,
+             'user': None, 'spawn_time': None, 'first_seen': 1.0, 'alive': True,
+             'env_vars': None, 'env_note': None},
+            {'pid': pid, 'ppid': 1, 'image': r'C:\Temp\evil.exe', 'command_line': 'evil.exe',
+             'user': 'bob', 'spawn_time': None, 'first_seen': 2.0, 'alive': True,
+             'env_vars': {'PATH': 'x'}, 'env_note': None},
+        ],
+        'edges': [{'from': 1, 'to': pid, 'label': 'EXEC'}],
+        'incomplete': False,
+    }
+
+
+def test_forensic_snapshot_captured_at_warning_threshold():
+    engine = HeuristicEngine(config={'thresholds': {'warning': 25, 'critical': 80},
+                                     'decay_points_per_second': 0.0,
+                                     'ransomware': {'file_event_window_seconds': 20, 'file_event_threshold': 60},
+                                     'correlator': {'fuse_window_seconds': 2.0},
+                                     'self_test': {'interval_seconds': 300, 'timeout_seconds': 15}})
+    engine.ancestry_provider = _fake_ancestry
+    pid = fresh_pid()
+    engine._add_score(pid, 30, 'staging dir exec', check_id='staging_dir')
+    snapshot = engine.forensic_snapshots[pid]
+    assert snapshot['trigger'] == 'warning_threshold'
+    assert snapshot['ancestry']['nodes'][0]['image'] == r'C:\Windows\explorer.exe'
+    assert snapshot['chain_summary'] == 'explorer.exe -> evil.exe'
+    assert snapshot['ancestry_note'] is None
+    assert snapshot['activity_span_seconds'] is not None
+
+
+def test_forensic_snapshot_first_wins_not_overwritten_on_escalation():
+    engine = HeuristicEngine()
+    engine.ancestry_provider = _fake_ancestry
+    pid = fresh_pid()
+    # 30 (below warning) + 30 again (same check, fresh dispatch) crosses
+    # the warning tier -> first snapshot; then +90 crosses critical.
+    engine._add_score(pid, 30, 'staging dir exec', check_id='staging_dir_a')
+    engine._add_score(pid, 30, 'staging dir exec 2', check_id='staging_dir_b')   # warning @ 60
+    engine._add_score(pid, 90, 'Defender tampering', check_id='defender_tamper')  # critical @ 150
+    # The escalation must NOT have replaced the evidence: one snapshot per
+    # PID, the first capture wins.
+    assert engine.forensic_snapshots[pid]['trigger'] == 'warning_threshold'
+    assert engine.forensic_snapshots[pid]['score_at_capture'] == 60
+
+
+def test_mitigate_captures_snapshot_when_none_exists():
+    engine = HeuristicEngine()
+    engine.ancestry_provider = _fake_ancestry
+    pid = fresh_pid()
+    engine.mitigate(pid)  # direct dashboard-style request, no prior score
+    assert engine.forensic_snapshots[pid]['trigger'] == 'mitigation_requested'
+
+
+def test_forensic_snapshot_without_provider_degrades_honestly():
+    engine = HeuristicEngine()
+    pid = fresh_pid()
+    engine._add_score(pid, 90, 'tamper', check_id='defender_tamper')
+    snapshot = engine.forensic_snapshots[pid]
+    assert snapshot['ancestry'] is None
+    assert 'no lineage tracker' in snapshot['ancestry_note']
+
+
+def test_forensic_snapshot_provider_failure_degrades_not_raises():
+    engine = HeuristicEngine()
+    def _boom(pid):
+        raise RuntimeError('tracker exploded')
+    engine.ancestry_provider = _boom
+    pid = fresh_pid()
+    engine._add_score(pid, 90, 'tamper', check_id='defender_tamper')  # must not raise
+    snapshot = engine.forensic_snapshots[pid]
+    assert snapshot['ancestry'] is None
+    assert 'failed' in snapshot['ancestry_note']
+
+
+def test_process_access_edge_labels_the_snapshot():
+    # The Windows analog of the MMAP(RWX) edge: an untrusted process
+    # opening LSASS with dangerous rights records an access edge, and the
+    # actor's forensic snapshot carries it as trigger_edge - with BOTH the
+    # raw OpenProcess(mask) observation label and the syscall-family label
+    # the mask implies (VM_WRITE present -> MMAP(RWX)).
+    engine = HeuristicEngine()
+    engine.ancestry_provider = _fake_ancestry
+    actor = fresh_pid()
+    engine._handle_process_access({
+        'SourceProcessId': actor, 'SourceImage': r'C:\Temp\mimikatz.exe',
+        'TargetProcessId': 700, 'TargetImage': 'c:\\windows\\system32\\lsass.exe',
+        'GrantedAccess': '0x143A',
+    })
+    assert actor in engine.forensic_snapshots  # +70 crosses warning(50)
+    edge = engine.forensic_snapshots[actor]['trigger_edge']
+    # The handler lowercases GrantedAccess with the rest of the event
+    # fields (same normalization every rule matches against), so the edge
+    # label carries the lowercased mask - identical text to what the
+    # finding's context string shows the analyst.
+    assert edge['label'] == 'OpenProcess(0x143a)'
+    assert edge['syscall'] == 'MMAP(RWX)'
+    assert edge['to'] == 700
+    # The access edge must ALSO be merged into the ancestry's edge list
+    # (kind='access') so the reconstructed attack chain is one graph:
+    # birth edges (EXEC) plus the injection edge.
+    ancestry_edges = engine.forensic_snapshots[actor]['ancestry']['edges']
+    access_edges = [e for e in ancestry_edges if e.get('kind') == 'access']
+    assert len(access_edges) == 1
+    assert access_edges[0]['syscall'] == 'MMAP(RWX)'
+    assert access_edges[0]['to'] == 700
+
+
+def test_access_edge_syscall_label_follows_the_rights_mask():
+    # The syscall vocabulary on access edges, derived from the granted
+    # rights: VM_WRITE or ALL_ACCESS -> MMAP(RWX) (can map/write executable
+    # memory into the victim); CREATE_THREAD without write -> CREATETHREAD
+    # (remote-thread primitive); anything else stays an honest raw
+    # OpenProcess(mask) with no injection claim.
+    engine = HeuristicEngine()
+    cases = [
+        ('0x0020', 'MMAP(RWX)'),      # PROCESS_VM_WRITE alone
+        ('0x143A', 'MMAP(RWX)'),      # dump/inject combo carrying VM_WRITE
+        ('0x1FFFFF', 'MMAP(RWX)'),    # PROCESS_ALL_ACCESS
+        ('0x0002', 'CREATETHREAD'),   # CREATE_THREAD only
+        ('0x0010', 'OpenProcess(0x0010)'),  # VM_READ only - reads, not writes
+    ]
+    actor = fresh_pid()
+    for i, (mask, expected) in enumerate(cases):
+        engine._record_access_edge(actor, 900 + i, f'target{i}.exe', mask)
+        edge = engine._access_edge_for(actor)
+        assert edge['syscall'] == expected, f"mask {mask} must label as {expected}"
+
+
+def test_snapshot_without_access_edge_has_no_connection_note():
+    # A chain-only detection (no process-access event ever seen for this
+    # PID) must not invent a connection edge - the ancestry is births only,
+    # all labeled EXEC, and the forensic log line carries no edge note.
+    engine = HeuristicEngine()
+    engine.ancestry_provider = _fake_ancestry
+    pid = fresh_pid()
+    engine._add_score(pid, 90, 'Defender tampering', check_id='defender_tamper')
+    snapshot = engine.forensic_snapshots[pid]
+    assert snapshot['trigger_edge'] is None
+    assert all(e['label'] == 'EXEC' for e in snapshot['ancestry']['edges'])
 
 
 if __name__ == "__main__":

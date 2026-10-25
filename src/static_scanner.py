@@ -3,6 +3,8 @@ import json
 import hashlib
 import logging
 
+import hands_on
+
 
 # Well-known publishers frequently spoofed via PE version-info resources.
 # If a binary claims one of these but ships no Authenticode signature blob
@@ -73,10 +75,10 @@ class StaticScanner:
             # Check Sections
             for sec in sections:
                 if sec.get('is_rwx'):
-                    self.engine.add_static_score(file_hash, 30, f"{filename}: RWX Section found ({sec.get('name')})")
+                    self.engine.add_static_score(file_hash, 30, f"{filename}: RWX Section found ({sec.get('name')})", check_id='rwx_section')
                 
                 if sec.get('entropy', 0) > 7.5:
-                    self.engine.add_static_score(file_hash, 30, f"{filename}: High entropy section ({sec.get('name')} - {sec.get('entropy')})")
+                    self.engine.add_static_score(file_hash, 30, f"{filename}: High entropy section ({sec.get('name')} - {sec.get('entropy')})", check_id='entropy_section')
 
                 structural_features.append(f"{sec.get('name')}:{sec.get('virtual_size')}")
 
@@ -87,31 +89,31 @@ class StaticScanner:
                     import_flat.append(f.lower())
             
             if 'virtualallocex' in import_flat and 'writeprocessmemory' in import_flat:
-                self.engine.add_static_score(file_hash, 40, f"{filename}: High-risk IAT (Injection pattern)")
+                self.engine.add_static_score(file_hash, 40, f"{filename}: High-risk IAT (Injection pattern)", check_id='injection_iat')
             
             if 'setwindowshookexa' in import_flat and 'httpsendrequesta' in import_flat:
-                self.engine.add_static_score(file_hash, 40, f"{filename}: High-risk IAT (Keylogger/Exfil pattern)")
+                self.engine.add_static_score(file_hash, 40, f"{filename}: High-risk IAT (Keylogger/Exfil pattern)", check_id='keylogger_iat')
 
             # LSASS credential-dumping IAT pattern, mirrored from Fibratus's
             # credential_access_lsass_memory_dump_via_minidumpwritedump rule:
             # MiniDumpWriteDump (dbghelp.dll) reachable alongside OpenProcess
             # is the classic procdump/Mimikatz-style LSASS dump primitive.
             if 'minidumpwritedump' in import_flat and 'openprocess' in import_flat:
-                self.engine.add_static_score(file_hash, 60, f"{filename}: High-risk IAT (LSASS memory dump primitive - MiniDumpWriteDump+OpenProcess)")
+                self.engine.add_static_score(file_hash, 60, f"{filename}: High-risk IAT (LSASS memory dump primitive - MiniDumpWriteDump+OpenProcess)", check_id='lsass_dump_iat')
 
             # AMSI bypass pattern: AmsiScanBuffer is the function malware
             # patches in-memory (via VirtualProtect to make its code page
             # writable) to make Windows' AV scan interface always report
             # "clean" - a very common PowerShell/.NET-loader evasion step.
             if 'amsiscanbuffer' in import_flat and 'virtualprotect' in import_flat:
-                self.engine.add_static_score(file_hash, 45, f"{filename}: High-risk IAT (AMSI bypass pattern - AmsiScanBuffer+VirtualProtect)")
+                self.engine.add_static_score(file_hash, 45, f"{filename}: High-risk IAT (AMSI bypass pattern - AmsiScanBuffer+VirtualProtect)", check_id='amsi_bypass_iat')
 
             # Same technique against ETW (Event Tracing for Windows)
             # instead of AMSI - patching EtwEventWrite blinds exactly the
             # kind of Sysmon/EDR telemetry this project's own behavioral
             # monitor depends on.
             if 'etweventwrite' in import_flat and 'virtualprotect' in import_flat:
-                self.engine.add_static_score(file_hash, 45, f"{filename}: High-risk IAT (ETW patch/evasion pattern - EtwEventWrite+VirtualProtect)")
+                self.engine.add_static_score(file_hash, 45, f"{filename}: High-risk IAT (ETW patch/evasion pattern - EtwEventWrite+VirtualProtect)", check_id='etw_patch_iat')
 
             # SeDebugPrivilege acquisition: the standard precursor to
             # opening a handle on a protected process like LSASS (Task
@@ -120,7 +122,7 @@ class StaticScanner:
             # lower-confidence precursor signal it's still worth surfacing).
             if 'adjusttokenprivileges' in import_flat and 'openprocesstoken' in import_flat and \
                any(f in import_flat for f in ('lookupprivilegevaluea', 'lookupprivilegevaluew')):
-                self.engine.add_static_score(file_hash, 25, f"{filename}: IAT pattern - token privilege escalation (SeDebugPrivilege-style acquisition)")
+                self.engine.add_static_score(file_hash, 25, f"{filename}: IAT pattern - token privilege escalation (SeDebugPrivilege-style acquisition)", check_id='sedebugprivilege_iat')
 
             # Direct/native (Nt*/Zw*) syscalls alongside classic injection
             # APIs is a common EDR-evasion technique: usermode API hooks
@@ -130,7 +132,7 @@ class StaticScanner:
             # while still achieving the same injection primitive.
             has_native_syscall_import = any(f.startswith('nt') or f.startswith('zw') for f in import_flat)
             if has_native_syscall_import and ('virtualallocex' in import_flat or 'writeprocessmemory' in import_flat):
-                self.engine.add_static_score(file_hash, 35, f"{filename}: IAT pattern - direct native (Nt*/Zw*) syscalls alongside injection APIs (possible usermode-hook evasion)")
+                self.engine.add_static_score(file_hash, 35, f"{filename}: IAT pattern - direct native (Nt*/Zw*) syscalls alongside injection APIs (possible usermode-hook evasion)", check_id='native_syscall_evasion')
 
             # Ransomware static pattern: bulk file enumeration plus a
             # crypto API - the static analog of the FileCreate-burst
@@ -139,7 +141,7 @@ class StaticScanner:
             has_file_enum = any(f in import_flat for f in ('findfirstfilew', 'findnextfilew', 'findfirstfilea'))
             has_crypto_api = any(f in import_flat for f in ('cryptencrypt', 'bcryptencrypt', 'cryptgenkey', 'bcryptgenrandom'))
             if has_file_enum and has_crypto_api:
-                self.engine.add_static_score(file_hash, 45, f"{filename}: IAT pattern - bulk file enumeration + crypto API (possible ransomware)")
+                self.engine.add_static_score(file_hash, 45, f"{filename}: IAT pattern - bulk file enumeration + crypto API (possible ransomware)", check_id='ransomware_static')
 
             # String-level indicators from tools/extract_features.py's
             # regex scan (crypto-clipper wallet patterns, webhook/bot C2
@@ -148,7 +150,7 @@ class StaticScanner:
             for indicator, present in string_indicators.items():
                 if present:
                     label = STRING_INDICATOR_LABELS.get(indicator, indicator)
-                    self.engine.add_static_score(file_hash, 25, f"{filename}: {label}")
+                    self.engine.add_static_score(file_hash, 25, f"{filename}: {label}", check_id=f'string_indicator:{indicator}')
 
             # Imphash match against known-family intel (see
             # data/known_imphashes.json, populated by
@@ -157,14 +159,38 @@ class StaticScanner:
             # sharing an imphash almost always share compiler-emitted
             # binary lineage even after the bytes are repacked, so this
             # catches variants this project has never seen a sample of.
+            #
+            # Cobalt Strike is split out as its own classification: a
+            # positively-identified Cobalt Strike stager is a HANDS-ON
+            # THREAT (an operator's tooling on this host), not a generic
+            # family hit, and the tagged log line below is what the
+            # dashboard pins to the top of the alert queue with an orange
+            # banner (see hands_on.py + web_server.AlertStore). Scoring is
+            # identical either way - the classification changes how the
+            # finding is SURFACED, never how it is weighed.
             imphash = entry.get('imphash')
             if imphash and imphash in self.known_imphashes:
                 known = self.known_imphashes[imphash]
-                self.engine.add_static_score(
-                    file_hash, 70,
-                    f"{filename}: Imphash matches known family '{known.get('family', '?')}' "
-                    f"(source: {known.get('source', '?')}, {known.get('sample_count', '?')} samples seen)"
-                )
+                family = known.get('family', '?')
+                intel_note = (f"source: {known.get('source', '?')}, "
+                              f"{known.get('sample_count', '?')} samples seen")
+                if hands_on.is_cobalt_strike_family(family):
+                    logging.warning(
+                        f"{hands_on.HANDS_ON_TAG} {filename}: Cobalt Strike stager identified "
+                        f"- imphash '{imphash}' matches known family '{family}' ({intel_note})"
+                    )
+                    self.engine.add_static_score(
+                        file_hash, 70,
+                        f"{filename}: Cobalt Strike stager - imphash matches known family "
+                        f"'{family}' ({intel_note})",
+                        check_id='cobalt_strike_stager'
+                    )
+                else:
+                    self.engine.add_static_score(
+                        file_hash, 70,
+                        f"{filename}: Imphash matches known family '{family}' ({intel_note})",
+                        check_id='imphash_family'
+                    )
 
             structural_features.append(str(sorted(import_flat)))
 
@@ -180,7 +206,8 @@ class StaticScanner:
                     self.engine.add_static_score(
                         file_hash, 50,
                         f"{filename}: Unsigned binary claims to be published by '{version_info.get('CompanyName')}' "
-                        f"(ProductName='{version_info.get('ProductName', '?')}') - brand impersonation"
+                        f"(ProductName='{version_info.get('ProductName', '?')}') - brand impersonation",
+                        check_id='brand_impersonation'
                     )
 
             if self.rule_engine:
@@ -197,7 +224,18 @@ class StaticScanner:
                     'has_signature': has_signature,
                 }
                 for rule, message in self.rule_engine.evaluate_static(feature_dict):
-                    self.engine.add_static_score(file_hash, rule.score, f"{filename}: [RULE:{rule.id}] {message}")
+                    self.engine.add_static_score(file_hash, rule.score, f"{filename}: [RULE:{rule.id}] {message}", check_id=f'rule:{rule.id}')
+                    # A custom rule that self-declares Cobalt Strike earns
+                    # the HANDS-ON THREAT classification by operator
+                    # declaration - the rule author already made the
+                    # family-attribution call this tag requires. Same
+                    # tagged-line mechanism as the imphash path above, so
+                    # the dashboard pins and banners it identically.
+                    if hands_on.is_cobalt_strike_rule(rule.id, message):
+                        logging.warning(
+                            f"{hands_on.HANDS_ON_TAG} {filename}: Cobalt Strike stager identified "
+                            f"by custom rule '{rule.id}' - {message}"
+                        )
 
             # Calculate Structural Hash
             struct_str = "|".join(structural_features)
@@ -214,7 +252,7 @@ class StaticScanner:
                     # log line itself too.
                     if not self.engine.is_allowlisted(file_hash):
                         logging.warning(f"[STATIC] Metamorphic Clone Detected! {filename} and {other_file['filename']} share exact structural hash but different SHA-256.")
-                    self.engine.add_static_score(file_hash, 50, "Metamorphic Clone")
+                    self.engine.add_static_score(file_hash, 50, "Metamorphic Clone", check_id='metamorphic_clone')
             else:
                 structural_hashes[struct_hash] = {
                     'filename': filename,

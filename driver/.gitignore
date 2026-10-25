@@ -1,0 +1,20 @@
+# Build output and dev-machine-specific signing material - regenerated
+# locally from source, never shared across machines.
+x64/
+Debug/
+Release/
+*.sys
+*.cer
+*.pfx
+*.pdb
+*.obj
+*.log
+# Compiled test-harness binaries (e.g. ppid_spoof_test.exe) - rebuild from
+# the committed .c source instead; same "never commit build output" policy
+# as the driver binaries above.
+*.exe
+# Captured output from running a test harness (e.g.
+# self_protect_test_output.txt) - a result of running the committed .c
+# source, not source itself.
+*_output.txt
+*_err.txt

@@ -340,7 +340,52 @@ checked (see above).
 telemetry from two sensors, the correlator, health/blind-state, and the log
 pipeline. It makes no claim about file, memory, network, or cloud-delivery
 failures because no sensor for those exists here, and it does not stop real
-services — that needs a disposable VM and is a deliberate follow-on.
+services — that needs a disposable VM, which is what the next section does.
+
+### Live evaluation in a VM (`vm_eval.py`)
+
+The lab above uses synthetic events. `vm_eval.py` is the real thing: run it
+inside a disposable VM next to a running `web_server.py`, and it launches
+harmless emulations of attacker techniques, then reads the agent's own
+`/api/alerts` and `/api/summary` to score what it noticed.
+
+```powershell
+python vm_eval.py --list                     # scenarios, no side effects
+python vm_eval.py --vm                       # attacks + benign corpus (elevated shell)
+python vm_eval.py --vm --sensor-kill         # also stop/restart the Sysmon service
+python vm_eval.py --vm --json ..\reports\vm_eval.json
+```
+
+Per scenario it reports detected/missed, time to alert, peak score and
+whether the agent auto-mitigated. Nothing is downloaded, disabled, injected
+or encrypted: the Defender-tamper command is only printed, the download
+cradle targets a refused loopback port, the LSASS test opens and closes a
+handle without reading, the shadow-copy delete uses a nil GUID, and the
+Run key, scheduled task, service and files are removed afterwards.
+
+- **Rule-backed scenarios** (encoded PowerShell, download cradle, Office
+  parent, staging-directory exec, Defender tamper, Run key, LSASS handle,
+  ransomware-style burst) must be detected; a miss fails the run.
+- **Gap scenarios** (scheduled task, service creation, shadow-copy delete,
+  certutil) have no rule today. They are reported as `NO RULE` — a coverage
+  map, not a failure — and flip to `DETECTED*` if a rule is added later.
+- **Benign corpus**: ordinary commands, several containing text that older
+  rules false-positived on (`grep -E`, `sed -e`, `Set-MpPreference`). Any
+  alert or mitigation is a `FALSE POSITIVE` and fails the run.
+- **`--sensor-kill`**: stops Sysmon while ETW keeps delivering, and checks
+  the sensor goes stale, `blind_state` becomes `DEGRADED`, the caveat is
+  raised, the watchdog logs it, and everything recovers to `HEALTHY` after
+  the service restarts. The service is always restarted, even on failure.
+
+It refuses to run without `--vm` and without elevation, and refuses to start
+unless both sensors are live (an idle VM starts so few processes that a
+healthy ETW sensor can look stale; the harness warms it up first).
+`test_vm_eval.py` checks every launcher against the real engine rules
+without starting any scenario process, so a rule change that silently breaks
+a scenario fails the test suite.
+
+Not covered, on purpose: process injection, parent-PID spoofing and log
+clearing (no safe emulation that proves a distinct signal).
 
 ## What each detector actually catches
 
@@ -372,6 +417,92 @@ Matching Sigma rules for the Sysmon-driven detections live in
 [`rules/sigma.yml`](rules/sigma.yml); YARA rules for the static/family
 detections live in [`rules/static.yar`](rules/static.yar) and
 [`rules/family_signatures.yar`](rules/family_signatures.yar).
+
+## Detection forensics: ancestry, hands-on classification, live status, dwell time
+
+Four evidence capabilities sit on top of the scoring engine, all additive —
+none of them change what gets detected or mitigated, only what is recorded
+and surfaced about the detections the engine already makes.
+
+**Memory Ancestry Graph** (`src/process_tracker.py` +
+`heuristic_engine._capture_forensic_snapshot`). The moment a PID first
+crosses the warning or critical threshold (or someone requests its
+mitigation), the engine captures a forensic snapshot: the full known
+ancestor chain — PID, PPID, image, command line, user, spawn time, and the
+time this agent first observed each node — with every parent→child edge
+labeled `EXEC` (the syscall family that created the link), plus any recent
+process-*access* edge the PID originated, labeled in the same syscall
+vocabulary: `MMAP(RWX)` when the granted rights let the actor map/write
+executable memory into the victim, `CREATETHREAD` for the remote-thread
+primitive, or the raw `OpenProcess(mask)` otherwise. Birth edges and the
+injection edge are presented as **one reconstructed attack chain**
+(`kind: 'access'` marks the non-parental edge) — automatically, at
+detection time, with no analyst effort. Snapshots are taken **once per
+PID** (the first threshold crossing wins — escalation does not rewrite
+evidence) and **survive mitigation and process death on purpose**: by the
+time a human opens the alert, `mitigate()` may long since have terminated
+the process, and a dead process's ancestry is unrecoverable from psutil.
+Environment variables are captured best-effort, only for still-alive
+ancestors, only when the panel is opened — a dead ancestor reports
+`environment unrecoverable: process has exited` instead of a silent null.
+Every chain reports whether it is complete or partial (`incomplete`), so a
+truncated walk is never mistaken for a full one. The headless CLI
+entrypoint wires the same tracker the dashboard does, so both entrypoints
+produce identical evidence.
+
+**HANDS-ON THREAT classification** (`src/hands_on.py`). A positively-
+identified **Cobalt Strike stager** is a different class of detection from
+generic shellcode/family hits: it means an operator's tooling is (or is
+about to be) executing on this host. Those detections — an imphash match
+against a Cobalt Strike intel family, or a custom YAML rule that
+declares Cobalt Strike — carry the `[HANDS-ON THREAT]` marker, and the
+dashboard's alert store pins them to the **top of the alert queue
+regardless of timestamp** (page-size limits are applied *after* pinning,
+so the one alert that must be seen is never the one dropped) and renders
+them with an **orange HANDS-ON THREAT banner**. Classification is
+identity-evidence only, by exact family-alias match — structural patterns
+(download-execute IAT trios, RWX sections, entropy) never earn the tag,
+so when the banner shows, it means Cobalt Strike. Scoring is identical
+either way; the classification changes how the finding is surfaced, not
+how it is weighed.
+
+**Live Agent Feedback** (`/api/processes/<pid>/live`). One click answers
+"is the attacker still inside right now": alive/dead, name, status,
+threads, memory, open files, active network connections, and mapped-module
+count — a single psutil snapshot taken inside the request. Individual
+reads an OS denies (elevated/protected processes) come back listed under
+`denied` rather than failing the whole answer, because "alive but locked
+down" is itself an answer.
+
+**Attacker Dwell Time Calculator** (`src/module_inspector.py`). The active
+sweep is the agent's only direct witness of *when a suspicious thing first
+appeared*, so it keeps two bounded first-seen ledgers:
+
+- *Module residency* — every suspicious-path module; flagged findings
+  report how long the module has been resident (`- resident for
+  18d 3h 4m`), provenance stated (`dwell_source:
+  agent_first_observation`).
+- *Anonymous memory regions* — every **executable anonymous** (no file
+  backing) region in every process swept. That is where shellcode lives:
+  no file, no module, no on-disk artifact. First-seen is recorded BEFORE
+  any flagging decision and for RX-at-rest regions too (the
+  alloc-RW → write → reprotect-RX stealth shape means a region can become
+  shellcode long after it first appeared), so the age reported when a
+  detection fires is measurement, not reconstruction. Only the
+  shellcode-shaped combination — anonymous AND writable AND executable
+  (RWX) — is scored (`anonymous_rwx_region`), with the region's age in
+  the finding (`- resident for 18d 4h 12m`); RX-only regions are tracked
+  but never flagged, because legitimate JIT runtimes (V8, .NET, the JVM)
+  keep anonymous executable code pages at rest. The dwell figure is
+  mathematically derived from the agent's own observation record
+  (`now - first_seen`) — the form of forensic proof that holds up when
+  its provenance, not a log-timestamp guess, is what gets examined.
+
+All stores are bounded (snapshots, access edges, both dwell ledgers —
+same LRU discipline as every other buffer here), and the dashboard exposes
+live status and the ancestry chain as per-row **Live / Chain** buttons in
+the Endpoint Processes table, rendered textContent-only (detection
+payloads carry attacker-controlled strings).
 
 ## Threat intel sync (MalwareBazaar)
 
@@ -795,12 +926,14 @@ mal_project/
 │   ├── sensor_health.py     Per-sensor heartbeat tracking + observe-only staleness watchdog + aggregate blind-state
 │   ├── self_test.py         Periodic benign self-test - proves the telemetry/alert pipeline actually delivers, not just that a thread is alive
 │   ├── failure_lab.py       Software-only failure-injection lab - breaks the telemetry pipeline on purpose and verifies detection/fallback/recovery
+│   ├── vm_eval.py           Live VM evaluation: harmless technique emulations + benign corpus scored against the running agent's API
 │   ├── module_inspector.py Active live-process module sweep
 │   ├── rule_engine.py       Additive YAML rule pack (rules/custom/*.yml) - see Custom detection rules
 │   ├── detection_config.py  Config-driven tunables (config/detection.yml) - decay/thresholds/ransomware window
-│   ├── process_tracker.py   Parent/child process lineage (Velociraptor pattern) for Process Explorer
+│   ├── process_tracker.py   Parent/child lineage + full ancestry graph (PID/PPID/cmdline/user/spawn time, EXEC edges) for Process Explorer & forensic snapshots
 │   ├── web_server.py        Dashboard entry point - same wiring as main.py + JSON API, self-elevates
 │   ├── dashboard_data.py    Pure data-shaping (severity/category, chart/table rows) for web_server.py
+│   ├── conftest.py          Pytest bootstrap: stand-ins for Windows-only imports so the suite runs off-Windows too
 │   ├── webapp/              Dashboard frontend (HTML/CSS/JS, Chart.js via CDN)
 │   └── test_*.py            Self-checks (synthetic-XML rule tests, static-scan fixtures, mocked sweeps) - `python test_x.py`
 ├── tools/

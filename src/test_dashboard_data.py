@@ -58,6 +58,26 @@ def test_categorize_telemetry_contradiction():
     assert severity_of(record) == "WARNING"
 
 
+def test_categorize_kernel_sourced_findings():
+    # Kernel driver sensor findings (see heuristic_engine.py's
+    # evaluate_kernel_lsass_access/evaluate_kernel_driver_load and the
+    # kernel_ppid_spoof check in _handle_process_create) - exact message
+    # wording those three checks actually log, so a wording change there
+    # that silently falls through to "Other" gets caught here.
+    assert categorize(
+        "Untrusted process access to LSASS (Access: 0x1438) - Potential "
+        "credential dumping [kernel-observed]"
+    ) == "Credential Access"
+    assert categorize(
+        "Kernel-mode driver loaded: evil.sys (base=0xfffff80000000000) [kernel-observed]"
+    ) == "Persistence"
+    assert categorize(
+        "Kernel-verified PPID spoofing: process claims parent PID 1 but was "
+        "actually created by PID 999 (PROC_THREAD_ATTRIBUTE_PARENT_PROCESS "
+        "or equivalent) - unspoofable kernel ground truth, not a cross-sensor inference"
+    ) == "Defense Evasion"
+
+
 def test_build_process_rows_sorts_and_labels():
     engine = HeuristicEngine()
     engine.process_scores = {111111: 90, 222222: 60, 333333: 10}
@@ -112,6 +132,7 @@ if __name__ == "__main__":
     test_categorize_first_match_wins()
     test_categorize_telemetry_contradiction()
     test_categorize_ignores_lifecycle_messages_even_with_keyword_collision()
+    test_categorize_kernel_sourced_findings()
     test_build_process_rows_sorts_and_labels()
     test_build_static_rows_recovers_filename_and_verdict()
     test_bucket_alerts_places_in_correct_minute_and_ignores_outside_window()
