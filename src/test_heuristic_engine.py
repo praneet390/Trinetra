@@ -272,6 +272,18 @@ def test_normalize_command_line():
     assert he._normalize_command_line("  padded  ") == "padded"
 
 
+def test_is_trusted_system_path():
+    # Shared by the hollowing/LSASS access checks and the kernel-sourced
+    # checks (kernel_lsass_access, kernel_ppid_spoof) - handles both a
+    # drive-letter path and the bare NT-style path ETW/Sysmon sometimes hand
+    # back, same as test_defender_tamper_host_match_is_case_insensitive_
+    # and_path_agnostic proves for the (separate) Defender-tamper host gate.
+    assert he._is_trusted_system_path(r"c:\windows\system32\runtimebroker.exe")
+    assert he._is_trusted_system_path(r"\windows\syswow64\dllhost.exe")
+    assert not he._is_trusted_system_path(r"c:\users\bob\appdata\local\temp\evil.exe")
+    assert not he._is_trusted_system_path("")
+
+
 def test_defender_tamper_still_respects_the_protected_floor():
     # The two-layer safety floor must hold for the tamper rule too: the
     # agent's own PID is never scored, so mitigate() is never reached.
@@ -777,17 +789,61 @@ def test_evaluate_kernel_driver_load_never_raises_on_bad_input():
 # for why this is dispatched independently rather than fused with Sysmon/
 # ETW's own (spoofable) ParentProcessId claim.
 
-def test_kernel_ppid_spoof_scores_and_crosses_critical_threshold():
+def _handle_kernel_ppid_spoof(pid, real_creator_pid, resolved_creator_exe=None,
+                               creator_resolution_raises=False):
+    """Drives _handle_process_create's kernel_ppid_spoof branch with the
+    real creator's psutil.Process().exe() resolution under test control -
+    mirrors the he.psutil.Process monkeypatch pattern used throughout this
+    file (e.g. test_evaluate_kernel_lsass_access_trusted_path_source_
+    scores_reduced)."""
     engine = HeuristicEngine()
+    original = he.psutil.Process
+    if creator_resolution_raises:
+        def _raise(p):
+            raise psutil.NoSuchProcess(p)
+        he.psutil.Process = _raise
+    else:
+        he.psutil.Process = lambda p: _fake_resolvable_process(resolved_creator_exe)
+    try:
+        engine._handle_process_create({
+            'ProcessId': pid, 'ParentProcessId': 1, 'Image': 'evil.exe',
+            'ParentImage': None, 'CommandLine': None, '_source': 'kernel',
+            '_kernel_real_creator_pid': real_creator_pid, '_kernel_ppid_spoof_detected': True,
+        })
+    finally:
+        he.psutil.Process = original
+    return engine
+
+
+def test_kernel_ppid_spoof_scores_and_crosses_critical_threshold():
+    # Real creator doesn't resolve to a trusted System32/SysWOW64 broker -
+    # fails closed to full severity. +80 alone crosses the >=80 mitigation
+    # threshold in one shot, reset to 0 - same designed outcome as
+    # test_defender_tamper_command_line above.
     pid = fresh_pid()
-    engine._handle_process_create({
-        'ProcessId': pid, 'ParentProcessId': 1, 'Image': 'evil.exe',
-        'ParentImage': None, 'CommandLine': None, '_source': 'kernel',
-        '_kernel_real_creator_pid': 999, '_kernel_ppid_spoof_detected': True,
-    })
-    # +80 alone crosses the >=80 mitigation threshold in one shot, reset to
-    # 0 - same designed outcome as test_defender_tamper_command_line above.
+    engine = _handle_kernel_ppid_spoof(pid, fresh_pid(), r"C:\Users\bob\AppData\Local\Temp\dropper.exe")
     assert engine.process_scores[pid] == 0
+
+
+def test_kernel_ppid_spoof_discounted_for_a_trusted_broker_real_creator():
+    # Regression test for the exact false positive live-fire testing
+    # surfaced: RuntimeBroker.exe (and other System32/SysWOW64 reparenting
+    # infrastructure) legitimately uses PROC_THREAD_ATTRIBUTE_PARENT_PROCESS
+    # for taskbar/Alt-Tab grouping - must not auto-mitigate real
+    # applications (it killed live Outlook processes three times before
+    # this discount existed).
+    pid = fresh_pid()
+    engine = _handle_kernel_ppid_spoof(pid, fresh_pid(), r"C:\Windows\System32\RuntimeBroker.exe")
+    assert engine.process_scores[pid] == 20, "trusted broker must discount to the precursor-signal weight, not auto-mitigate"
+
+
+def test_kernel_ppid_spoof_resolution_failure_fails_closed():
+    # Can't resolve the real creator's image at all (already exited, access
+    # denied) - must score as untrusted/full severity, the same "can't
+    # verify, so don't discount" posture as everywhere else in this engine.
+    pid = fresh_pid()
+    engine = _handle_kernel_ppid_spoof(pid, fresh_pid(), creator_resolution_raises=True)
+    assert engine.process_scores[pid] == 0  # +80 crosses critical, same as the untrusted case
 
 
 def test_kernel_ppid_spoof_not_flagged_when_driver_reports_no_mismatch():

@@ -247,6 +247,20 @@ def _is_dangerous_access(access_int, dangerous_bits):
     return access_int == PROCESS_ALL_ACCESS or bool(access_int & dangerous_bits)
 
 
+# Shared by every "is the actor a trusted OS caller" discount in this file
+# (hollowing/LSASS access, and the kernel-sourced checks below) - a single
+# definition so the four call sites can't quietly drift out of sync.
+TRUSTED_SYSTEM_PATHS = ('\\windows\\system32\\', '\\windows\\syswow64\\')
+
+
+def _is_trusted_system_path(image_path):
+    """True if `image_path` (already lowercased by the caller) resolves
+    under System32/SysWOW64 - handles both a bare NT-style path
+    ('\\windows\\system32\\...') and a drive-letter path
+    ('c:\\windows\\system32\\...')."""
+    return any(image_path.startswith(p) or f'c:{p}' in image_path for p in TRUSTED_SYSTEM_PATHS)
+
+
 class HeuristicEngine:
     def __init__(self, rule_engine=None, config=None, known_good_hashes=None):
         # Optional additive YAML rule pack (src/rule_engine.py) - evaluated
@@ -498,8 +512,7 @@ class HeuristicEngine:
                 # score) - the same posture as "can't verify, so don't
                 # discount" everywhere else safety-relevant in this engine.
                 source_image = ''
-            trusted_callers = ('\\windows\\system32\\', '\\windows\\syswow64\\')
-            is_trusted_path = any(source_image.startswith(p) or f'c:{p}' in source_image for p in trusted_callers)
+            is_trusted_path = _is_trusted_system_path(source_image)
 
             access_hex = f"0x{int(desired_access):x}"
             score = 30 if is_trusted_path else 70
@@ -870,19 +883,43 @@ class HeuristicEngine:
         # that attribute cannot influence. This is a fundamentally stronger
         # signal than the existing [TELEMETRY_CONTRADICTION] log (which only
         # proves Sysmon and ETW disagree with EACH OTHER about the claim,
-        # never whether the claim itself is true) - scored high enough to
-        # cross the critical mitigation threshold on its own, the same way
-        # defender_tamper already does, because kernel ground truth has no
-        # realistic false-positive path the way a text-pattern match does.
+        # never whether the claim itself is true).
+        #
+        # It does, however, have a real false-positive path the kernel-
+        # ground-truth framing above doesn't fully cover: Windows' own
+        # packaged-app/COM activation infrastructure (RuntimeBroker.exe,
+        # a DcomLaunch-hosted svchost.exe, a dllhost.exe COM surrogate,
+        # explorer.exe) legitimately uses PROC_THREAD_ATTRIBUTE_PARENT_
+        # PROCESS to reparent a child for taskbar/Alt-Tab grouping - not to
+        # hide anything. Live-fire testing confirmed this at full severity:
+        # a single run auto-killed real Outlook processes (olk.exe,
+        # olkFullTrustExecutor.exe) three times, every one of them actually
+        # created by the SAME broker PID across different claimed parents -
+        # exactly that signature, not an attack. So this is scored like the
+        # hollowing/LSASS access checks above: full severity (crosses the
+        # critical threshold alone) when the real creator can't be verified
+        # as one of those trusted OS brokers, discounted to a precursor-
+        # signal weight (same tier as kernel_driver_load) when it can - an
+        # actual spoofing attack's real creator (the malware/dropper itself)
+        # will essentially never resolve to System32/SysWOW64.
         if data.get('_source') == 'kernel' and data.get('_kernel_ppid_spoof_detected'):
             real_creator = data.get('_kernel_real_creator_pid')
             claimed_parent = data.get('ParentProcessId')
-            self._score_once(
-                dedup_key, 'kernel_ppid_spoof', pid, 80,
-                f"Kernel-verified PPID spoofing: process claims parent PID {claimed_parent} but "
-                f"was actually created by PID {real_creator} (PROC_THREAD_ATTRIBUTE_PARENT_PROCESS "
-                f"or equivalent) - unspoofable kernel ground truth, not a cross-sensor inference"
+            try:
+                creator_image = psutil.Process(int(real_creator)).exe().lower()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, TypeError, ValueError):
+                creator_image = ''  # can't verify -> fails closed (untrusted/full score)
+            is_trusted_creator = _is_trusted_system_path(creator_image)
+            score = 20 if is_trusted_creator else 80
+            context = (
+                f"{'Trusted-broker' if is_trusted_creator else 'Kernel-verified'} PPID spoofing: process "
+                f"claims parent PID {claimed_parent} but was actually created by PID {real_creator} "
+                f"(PROC_THREAD_ATTRIBUTE_PARENT_PROCESS or equivalent) - unspoofable kernel ground truth, "
+                f"not a cross-sensor inference"
+                + (" (real creator resolves to a trusted System32/SysWOW64 broker - likely benign "
+                   "packaged-app/COM activation reparenting, not an attack)" if is_trusted_creator else "")
             )
+            self._score_once(dedup_key, 'kernel_ppid_spoof', pid, score, context)
 
         if 'temp' in image or 'users\\public' in image:
             self._score_once(dedup_key, 'staging_dir', pid, 30, f"Execution from staging directory: {image}")
@@ -909,8 +946,7 @@ class HeuristicEngine:
         granted_access = data.get('GrantedAccess', '').lower()
 
         access_int = _parse_granted_access(granted_access)
-        trusted_callers = ('\\windows\\system32\\', '\\windows\\syswow64\\')
-        is_trusted_path = any(source_image.startswith(p) or f'c:{p}' in source_image for p in trusted_callers)
+        is_trusted_path = _is_trusted_system_path(source_image)
 
         if 'svchost.exe' in target_image and _is_dangerous_access(access_int, HOLLOWING_DANGEROUS_BITS):
             # Signed System32 tools (SCM, WMI, admin utilities) routinely
