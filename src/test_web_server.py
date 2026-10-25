@@ -158,18 +158,23 @@ def test_backend_surfaces_telemetry_contradiction_as_a_categorized_alert():
 
 def test_backend_summary_blind_state_critically_blind_before_start():
     # Backend() alone (start() never called) is exactly what a fresh
-    # dashboard process looks like before either sensor has come up -
-    # zero events ever seen, both handles still None.
+    # dashboard process looks like before any sensor has come up -
+    # zero events ever seen, all three handles still None.
     backend = ws.Backend()
     assert backend.summary()["blind_state"] == "CRITICALLY_BLIND"
 
 
 def test_backend_summary_blind_state_healthy_when_both_sensors_live():
+    # "both" here now means all three (sysmon/etw/kernel) - a missing
+    # kernel driver sensor is just as real a visibility gap as a dead
+    # Sysmon subscription, so HEALTHY requires every one of them live.
     backend = ws.Backend()
     backend._sysmon_handle = object()
     backend._etw_handle = object()
+    backend._kernel_handle = object()
     backend.sysmon_health.touch()
     backend.etw_health.touch()
+    backend.kernel_health.touch()
     assert backend.summary()["blind_state"] == "HEALTHY"
 
 
@@ -177,8 +182,10 @@ def test_backend_summary_blind_state_degraded_when_one_sensor_down():
     backend = ws.Backend()
     backend._sysmon_handle = object()
     backend._etw_handle = object()
+    backend._kernel_handle = object()
     backend.sysmon_health.touch()
-    # etw_health never touched -> stale, sysmon still live
+    backend.kernel_health.touch()
+    # etw_health never touched -> stale, sysmon/kernel still live
     assert backend.summary()["blind_state"] == "DEGRADED"
 
 
@@ -186,8 +193,9 @@ def test_backend_summary_blind_state_partially_blind_once_events_were_seen():
     backend = ws.Backend()
     backend._sysmon_handle = object()
     backend._etw_handle = object()
+    backend._kernel_handle = object()
     backend.engine.total_events_seen = 1  # telemetry flowed at some point this session
-    # neither sensor touched -> both stale, no sensor currently live
+    # no sensor touched -> all stale, no sensor currently live
     assert backend.summary()["blind_state"] == "PARTIALLY_BLIND"
 
 
@@ -195,9 +203,11 @@ def test_backend_summary_blind_state_recovers_when_sensor_comes_back():
     backend = ws.Backend()
     backend._sysmon_handle = object()
     backend._etw_handle = object()
+    backend._kernel_handle = object()
     assert backend.summary()["blind_state"] == "CRITICALLY_BLIND"
     backend.sysmon_health.touch()
     backend.etw_health.touch()
+    backend.kernel_health.touch()
     assert backend.summary()["blind_state"] == "HEALTHY", "must be recomputed fresh on every summary() call"
 
 
@@ -205,6 +215,7 @@ def test_backend_summary_negative_evidence_reliable_only_when_healthy():
     backend = ws.Backend()
     backend._sysmon_handle = object()
     backend._etw_handle = object()
+    backend._kernel_handle = object()
     # CRITICALLY_BLIND (nothing touched yet) - "0 alerts" must not be
     # reported as trustworthy.
     summary = backend.summary()
@@ -213,6 +224,7 @@ def test_backend_summary_negative_evidence_reliable_only_when_healthy():
 
     backend.sysmon_health.touch()
     backend.etw_health.touch()
+    backend.kernel_health.touch()
     summary = backend.summary()
     assert summary["negative_evidence_reliable"] is True
     assert summary["visibility_caveat"] is None
@@ -222,13 +234,16 @@ def test_backend_summary_visibility_caveat_distinguishes_degraded_from_criticall
     backend = ws.Backend()
     backend._sysmon_handle = object()
     backend._etw_handle = object()
-    backend.sysmon_health.touch()  # sysmon live, etw never touched -> DEGRADED
+    backend._kernel_handle = object()
+    backend.sysmon_health.touch()
+    backend.kernel_health.touch()  # sysmon+kernel live, etw never touched -> DEGRADED
     degraded_summary = backend.summary()
     assert degraded_summary["blind_state"] == "DEGRADED"
 
     backend2 = ws.Backend()
     backend2._sysmon_handle = object()
-    backend2._etw_handle = object()  # neither touched -> CRITICALLY_BLIND
+    backend2._etw_handle = object()
+    backend2._kernel_handle = object()  # none touched -> CRITICALLY_BLIND
     critical_summary = backend2.summary()
     assert critical_summary["blind_state"] == "CRITICALLY_BLIND"
 
@@ -240,8 +255,10 @@ def test_backend_summary_reports_a_lossy_sensor_its_drop_count_and_recovery():
     backend = ws.Backend()
     backend._sysmon_handle = object()
     backend._etw_handle = object()
+    backend._kernel_handle = object()
     backend.sysmon_health.touch()
     backend.etw_health.touch()
+    backend.kernel_health.touch()
     healthy = backend.summary()
     assert healthy["blind_state"] == "HEALTHY" and healthy["etw_state"] == "live"
     assert healthy["etw_dropped_events"] == 0 and healthy["sysmon_dropped_events"] == 0
@@ -260,6 +277,7 @@ def test_backend_summary_reports_a_lossy_sensor_its_drop_count_and_recovery():
     time.sleep(0.07)
     backend.sysmon_health.touch()
     backend.etw_health.touch()
+    backend.kernel_health.touch()
     recovered = backend.summary()
     assert recovered["etw_state"] == "live" and recovered["blind_state"] == "HEALTHY"
     assert recovered["etw_dropped_events"] == 3, "the all-time count is kept after recovery"

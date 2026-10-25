@@ -43,6 +43,48 @@ def test_etw_only_dispatches_immediately_and_provisionally():
     assert data['CommandLine'] is None
 
 
+def test_submit_kernel_dispatches_immediately_with_kernel_fields():
+    # Kernel-sourced process-create (see kernel_sensor.py/sensor.c) - like
+    # ETW's provisional dispatch, this is deliberately NOT merged into the
+    # pending etw/sysmon fusion dict (see submit_kernel's own docstring):
+    # one dispatch, right away, every time.
+    engine = _FakeEngine()
+    correlator = pc.ProcessCorrelator(engine)
+    correlator.submit_kernel(1234, 1, 999, "evil.exe", ppid_spoof_detected=True)
+    assert len(engine.dispatches) == 1
+    event_id, data = engine.dispatches[0]
+    assert event_id == 1
+    assert data['ProcessId'] == 1234
+    assert data['ParentProcessId'] == 1
+    assert data['Image'] == "evil.exe"
+    assert data['ParentImage'] is None
+    assert data['CommandLine'] is None
+    assert data['_source'] == 'kernel'
+    assert data['_kernel_real_creator_pid'] == 999
+    assert data['_kernel_ppid_spoof_detected'] is True
+
+
+def test_submit_kernel_never_merges_with_a_pending_etw_or_sysmon_record():
+    # A kernel event and an ETW/Sysmon event for the SAME pid arriving close
+    # together must not fuse into one record the way etw+sysmon do for each
+    # other - the kernel path is independent corroboration, not a third
+    # input to that fusion (see submit_kernel's docstring).
+    engine = _FakeEngine()
+    correlator = pc.ProcessCorrelator(engine, fuse_window=0.01)
+    correlator.submit_etw(1234, 1, "evil.exe", "irrelevant")
+    correlator.submit_kernel(1234, 1, 999, "evil.exe", ppid_spoof_detected=False)
+    time.sleep(0.02)
+    correlator._gc_once()
+    # etw's own provisional dispatch, plus kernel's own immediate dispatch -
+    # two independent dispatches (sysmon never arrived, so etw drops
+    # silently after gc per test_etw_only_drops_silently_after_gc_with_no_
+    # second_dispatch - never a merged third).
+    assert len(engine.dispatches) == 2
+    sources = [d['_source'] for _, d in engine.dispatches]
+    assert sources.count('kernel') == 1
+    assert sources.count('etw') == 1
+
+
 def test_etw_only_drops_silently_after_gc_with_no_second_dispatch():
     engine = _FakeEngine()
     correlator = pc.ProcessCorrelator(engine, fuse_window=0.01)

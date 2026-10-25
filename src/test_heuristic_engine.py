@@ -664,6 +664,143 @@ def test_evaluate_etw_process_start_never_raises_on_bad_input():
     engine.evaluate_etw_process_start(None, parent_pid=None, image_name=None)  # must not raise
 
 
+# ---- evaluate_kernel_lsass_access (kernel driver sensor) ------------------
+# Mirrors the Sysmon/ETW LSASS check (test_lsass_*) above, same scores and
+# same trusted-path discount - but the kernel sensor only ever hands us a
+# PID (sensor.c has no image-path lookup of its own), so this resolves the
+# source image itself via psutil, unlike the Sysmon/ETW path which already
+# has SourceImage on the event. See heuristic_engine.py's own docstring for
+# why resolution failure fails closed (treated as untrusted).
+
+def _fake_resolvable_process(exe_path):
+    # Stubs exe() (what evaluate_kernel_lsass_access itself resolves),
+    # plus name()/create_time() - _add_score's own protected-floor check
+    # (_is_protected) and PID-reuse guard (_reset_score_if_pid_reused) call
+    # psutil.Process(pid) again independently, so the fake must satisfy all
+    # three or they raise AttributeError (caught by evaluate_kernel_lsass_
+    # access's own broad except, silently dropping the score - this is
+    # exactly the bug the counts-toward-heartbeat/scores tests below would
+    # otherwise mask).
+    return type("F", (), {
+        "exe": lambda self: exe_path,
+        "name": lambda self: "mimikatz.exe",  # not in PROTECTED_PROCESS_NAMES
+        "create_time": lambda self: 100.0,
+    })()
+
+
+def test_evaluate_kernel_lsass_access_untrusted_source_scores_full():
+    engine = HeuristicEngine()
+    pid = fresh_pid()
+    original = he.psutil.Process
+    he.psutil.Process = lambda p: _fake_resolvable_process(r"C:\Users\bob\AppData\Local\Temp\mimikatz.exe")
+    try:
+        engine.evaluate_kernel_lsass_access(pid, target_pid=700, desired_access=0x1010)
+    finally:
+        he.psutil.Process = original
+    assert engine.process_scores[pid] == 70
+
+
+def test_evaluate_kernel_lsass_access_trusted_path_source_scores_reduced():
+    engine = HeuristicEngine()
+    pid = fresh_pid()
+    original = he.psutil.Process
+    he.psutil.Process = lambda p: _fake_resolvable_process(r"C:\Windows\System32\taskmgr.exe")
+    try:
+        engine.evaluate_kernel_lsass_access(pid, target_pid=700, desired_access=0x1010)
+    finally:
+        he.psutil.Process = original
+    assert engine.process_scores[pid] == 30
+
+
+def test_evaluate_kernel_lsass_access_resolution_failure_fails_closed():
+    # Can't resolve the requestor's own image path (already exited, access
+    # denied, etc.) - must score as untrusted (full), not silently drop the
+    # finding or assume trusted.
+    engine = HeuristicEngine()
+    pid = fresh_pid()
+    original = he.psutil.Process
+    def _raise_no_such_process(p):
+        raise psutil.NoSuchProcess(p)
+    he.psutil.Process = _raise_no_such_process
+    try:
+        engine.evaluate_kernel_lsass_access(pid, target_pid=700, desired_access=0x1010)
+    finally:
+        he.psutil.Process = original
+    assert engine.process_scores[pid] == 70
+
+
+def test_evaluate_kernel_lsass_access_counts_toward_heartbeat():
+    engine = HeuristicEngine()
+    before = engine.total_events_seen
+    engine.evaluate_kernel_lsass_access(fresh_pid(), target_pid=700, desired_access=0x1010)
+    assert engine.total_events_seen == before + 1
+    assert engine.last_event_time is not None
+
+
+def test_evaluate_kernel_lsass_access_respects_protected_floor():
+    engine = HeuristicEngine()
+    engine.evaluate_kernel_lsass_access(4, target_pid=700, desired_access=0x1010)  # PID 4 = System
+    assert 4 not in engine.process_scores
+
+
+def test_evaluate_kernel_lsass_access_never_raises_on_bad_input():
+    engine = HeuristicEngine()
+    engine.evaluate_kernel_lsass_access(None, target_pid=None, desired_access=None)  # must not raise
+
+
+# ---- evaluate_kernel_driver_load (kernel driver sensor) -------------------
+
+def test_evaluate_kernel_driver_load_scores_low():
+    # Low, precursor-signal weight (see the method's own docstring) - a new
+    # kernel driver loading is not on its own strong enough to mitigate.
+    engine = HeuristicEngine()
+    pid = fresh_pid()
+    engine.evaluate_kernel_driver_load(pid, image_name="evil.sys", image_base=0xFFFFF80000000000)
+    assert engine.process_scores[pid] == 20
+
+
+def test_evaluate_kernel_driver_load_counts_toward_heartbeat():
+    engine = HeuristicEngine()
+    before = engine.total_events_seen
+    engine.evaluate_kernel_driver_load(fresh_pid(), image_name="ok.sys", image_base=0x1000)
+    assert engine.total_events_seen == before + 1
+    assert engine.last_event_time is not None
+
+
+def test_evaluate_kernel_driver_load_never_raises_on_bad_input():
+    engine = HeuristicEngine()
+    engine.evaluate_kernel_driver_load(None, image_name=None, image_base=None)  # must not raise
+
+
+# ---- kernel-verified PPID spoofing (_handle_process_create) ---------------
+# Routed here by process_correlator.submit_kernel - see its own docstring
+# for why this is dispatched independently rather than fused with Sysmon/
+# ETW's own (spoofable) ParentProcessId claim.
+
+def test_kernel_ppid_spoof_scores_and_crosses_critical_threshold():
+    engine = HeuristicEngine()
+    pid = fresh_pid()
+    engine._handle_process_create({
+        'ProcessId': pid, 'ParentProcessId': 1, 'Image': 'evil.exe',
+        'ParentImage': None, 'CommandLine': None, '_source': 'kernel',
+        '_kernel_real_creator_pid': 999, '_kernel_ppid_spoof_detected': True,
+    })
+    # +80 alone crosses the >=80 mitigation threshold in one shot, reset to
+    # 0 - same designed outcome as test_defender_tamper_command_line above.
+    assert engine.process_scores[pid] == 0
+
+
+def test_kernel_ppid_spoof_not_flagged_when_driver_reports_no_mismatch():
+    engine = HeuristicEngine()
+    pid = fresh_pid()
+    engine._handle_process_create({
+        'ProcessId': pid, 'ParentProcessId': 1, 'Image': r'C:\Windows\System32\notepad.exe',
+        'ParentImage': None, 'CommandLine': None, '_source': 'kernel',
+        '_kernel_real_creator_pid': 1, '_kernel_ppid_spoof_detected': False,
+    })
+    assert pid not in engine.process_scores
+
+
 # ---- _dispatch regression: evaluate_event behavior is unchanged -----------
 
 def test_dispatch_extraction_preserves_evaluate_event_behavior():

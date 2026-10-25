@@ -67,23 +67,28 @@ function setGauge(cardEl, arcEl, textEl, fraction, text, zone) {
 }
 
 function renderSensorHealthGauge(summary) {
-  // Real, computed value: how many of the two independent kernel sensors
-  // (see process_correlator.py) are currently live - not a fabricated score.
-  const states = [summary.sysmon_state, summary.etw_state];
+  // Real, computed value: how many of the three independent sensors
+  // (Sysmon + raw ETW, see process_correlator.py, plus the kernel driver
+  // sensor - see kernel_sensor.py) are currently live - not a fabricated
+  // score. A missing kernel driver (e.g. not built/signed/loaded on this
+  // host) shows up here exactly like Sysmon not being installed would.
+  const states = [summary.sysmon_state, summary.etw_state, summary.kernel_state];
   const liveCount = states.filter((s) => s === "live").length;
   const anyUnavailable = states.some((s) => s === "unavailable");
-  const fraction = liveCount / 2;
-  const zone = liveCount === 2 ? null : anyUnavailable ? "zone-critical" : "zone-warning";
+  const fraction = liveCount / 3;
+  const zone = liveCount === 3 ? null : anyUnavailable ? "zone-critical" : "zone-warning";
   setGauge(
     document.getElementById("gaugeSensorHealth"),
     document.getElementById("sensorHealthArc"),
     document.getElementById("sensorHealthText"),
-    fraction, `${liveCount}/2`, zone
+    fraction, `${liveCount}/3`, zone
   );
-  let sub = `Sysmon: ${summary.sysmon_state || "?"} · ETW: ${summary.etw_state || "?"}`;
+  let sub = `Sysmon: ${summary.sysmon_state || "?"} · ETW: ${summary.etw_state || "?"} · `
+          + `Kernel: ${summary.kernel_state || "?"}`;
   // "lossy" = alive but dropping events; say how many, so the size of the
   // hole in visibility is visible rather than just its existence.
-  const dropped = (summary.sysmon_dropped_events || 0) + (summary.etw_dropped_events || 0);
+  const dropped = (summary.sysmon_dropped_events || 0) + (summary.etw_dropped_events || 0)
+                + (summary.kernel_dropped_events || 0);
   if (dropped > 0) sub += ` · ${dropped} events dropped`;
   document.getElementById("sensorHealthSub").textContent = sub;
 }
@@ -137,7 +142,7 @@ function renderSummary(summary) {
   let badgeClass = "badge-ok";
   if (summary.sensor_status.includes("unavailable")) {
     badgeClass = "badge-off";
-  } else if (summary.sysmon_stale || summary.etw_stale || summary.sensor_status.includes("lossy")) {
+  } else if (summary.sysmon_stale || summary.etw_stale || summary.kernel_stale || summary.sensor_status.includes("lossy")) {
     badgeClass = "badge-warn";
   }
   badge.className = "badge " + badgeClass;

@@ -239,10 +239,13 @@ tbody tr:hover { background: var(--panel-2); }
 /* Process Explorer source column - which sensor(s) produced this row. See
    process_correlator.py: 'etw' is provisional (thin fields, arrived first),
    'fused' merged in Sysmon's richer fields shortly after, 'sysmon' is the
-   pre-correlator/single-sensor default. */
+   pre-correlator/single-sensor default, 'kernel' is driver-verified
+   ancestry (see kernel_sensor.py) - ground truth, not a claimed field, so
+   it gets the strongest treatment of the four. */
 .src-etw { color: var(--warning); }
 .src-fused { color: var(--accent); font-weight: 600; }
 .src-sysmon { color: var(--muted); }
+.src-kernel { color: var(--ok); font-weight: 600; }
 .sev-INFO { color: var(--info); }
 
 .empty-row td { color: var(--muted); text-align: center; padding: 22px; font-family: "Segoe UI", sans-serif; }

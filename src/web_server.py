@@ -32,6 +32,7 @@ from heuristic_engine import HeuristicEngine
 from static_scanner import StaticScanner
 from telemetry_monitor import start_monitor
 from etw_monitor import start_etw_monitor, stop_etw_monitor
+from kernel_sensor import ensure_driver_running, start_kernel_monitor, stop_kernel_monitor, stop_driver_service
 from module_inspector import ModuleInspector
 from process_correlator import ProcessCorrelator
 from rule_engine import RuleEngine
@@ -309,9 +310,11 @@ class ProcessActivityStore:
                 "command_line": data.get("CommandLine"),
                 "user": data.get("User"),
                 # 'sysmon' (default, pre-correlator/single-sensor rows),
-                # 'etw' (provisional - ETW's own thin fields only), or
-                # 'fused' (ETW's low latency + Sysmon's richer fields
-                # merged) - see process_correlator.py.
+                # 'etw' (provisional - ETW's own thin fields only), 'fused'
+                # (ETW's low latency + Sysmon's richer fields merged - see
+                # process_correlator.py), or 'kernel' (driver-verified
+                # ancestry, dispatched independently by submit_kernel -
+                # see kernel_sensor.py/process_correlator.py).
                 "source": data.get("_source", "sysmon"),
             })
 
@@ -342,10 +345,12 @@ class Backend:
         self.inspector = ModuleInspector(self.engine)
         self._sysmon_handle = None
         self._etw_handle = None
+        self._kernel_handle = None
         self.correlator = ProcessCorrelator(self.engine, fuse_window=self.config['correlator']['fuse_window_seconds'])
         self.engine.correlator = self.correlator
         self.sysmon_health = SensorHealth("sysmon")
         self.etw_health = SensorHealth("etw")
+        self.kernel_health = SensorHealth("kernel")
         # Wire the Memory Ancestry Graph provider: when the engine captures
         # a forensic snapshot at detection time it walks THIS tracker's
         # parent/child map (the same one feeding the Process Explorer
@@ -382,9 +387,22 @@ class Backend:
                                             on_drop=self.sysmon_health.record_drop)
         self._etw_handle = start_etw_monitor(self.engine, on_heartbeat=self.etw_health.touch,
                                              correlator=self.correlator, on_drop=self.etw_health.record_drop)
+
+        # Third, independent kernel sensor (driver/sensor/sensor.c) - ground
+        # truth for process ancestry and LSASS handle-access, unlike Sysmon/
+        # ETW's claimed-parent field. A missing/not-yet-loaded driver is a
+        # normal "sensor unavailable" condition, same as Sysmon not being
+        # installed - ensure_driver_running() only starts the already-
+        # built-and-signed service (see kernel_sensor.py's own docstring);
+        # it never builds or signs anything itself.
+        ensure_driver_running()
+        self._kernel_handle = start_kernel_monitor(self.engine, self.correlator,
+                                                    on_heartbeat=self.kernel_health.touch,
+                                                    on_drop=self.kernel_health.record_drop)
+
         threading.Thread(
             target=watchdog_loop,
-            args=([self.sysmon_health, self.etw_health],),
+            args=([self.sysmon_health, self.etw_health, self.kernel_health],),
             kwargs={"blind_state_fn": self._blind_state},
             daemon=True,
         ).start()
@@ -411,6 +429,13 @@ class Backend:
         pywintrace's consumer thread is the one that isn't. Idempotent."""
         etw_session, self._etw_handle = self._etw_handle, None
         stop_etw_monitor(etw_session)
+        # Unregisters self-protection and closes the comms channel, then
+        # stops (not deletes) the service - mirrors the ETW session's own
+        # start/stop symmetry above. Safe to call even if the kernel sensor
+        # never started.
+        kernel_session, self._kernel_handle = self._kernel_handle, None
+        stop_kernel_monitor(kernel_session)
+        stop_driver_service()
 
     def _module_sweep_loop(self):
         while True:
@@ -423,7 +448,8 @@ class Backend:
         same as the per-sensor labels below, so it reflects a sensor dying
         (or recovering) mid-run with no state to re-set anywhere."""
         return current_blind_state(
-            [(self._sysmon_handle, self.sysmon_health), (self._etw_handle, self.etw_health)],
+            [(self._sysmon_handle, self.sysmon_health), (self._etw_handle, self.etw_health),
+             (self._kernel_handle, self.kernel_health)],
             self.engine.total_events_seen,
         )
 
@@ -437,28 +463,36 @@ class Backend:
         # reflected here without needing sensor_status to be re-set anywhere.
         sysmon_label = sensor_label(self._sysmon_handle, self.sysmon_health)
         etw_label = sensor_label(self._etw_handle, self.etw_health)
+        # Third, independent kernel-driver sensor (driver/sensor/sensor.c via
+        # kernel_sensor.py) - ground truth for process ancestry and LSASS
+        # handle-access. A missing/unsigned/not-yet-loaded driver is a normal
+        # "sensor unavailable" condition, same as Sysmon not being installed.
+        kernel_label = sensor_label(self._kernel_handle, self.kernel_health)
         blind_state = self._blind_state()
         return {
             "hostname": socket.gethostname(),
             "session_start": self.session_start,
-            "sensor_status": f"Sysmon: {sysmon_label} | ETW: {etw_label}",
+            "sensor_status": f"Sysmon: {sysmon_label} | ETW: {etw_label} | Kernel: {kernel_label}",
             # Per-sensor liveness (see sensor_health.py) - observe-only, not
             # auto-restarted. A stale sensor doesn't mean detection stopped:
-            # the other sensor (and the correlator's sysmon-only/etw-only
-            # fallback dispatch) keeps working independently.
+            # the other sensors (and the correlator's sysmon-only/etw-only
+            # fallback dispatch) keep working independently.
             "sysmon_stale": self.sysmon_health.is_stale(),
             "etw_stale": self.etw_health.is_stale(),
+            "kernel_stale": self.kernel_health.is_stale(),
             # Structured per-sensor state ("live"/"stale"/"unavailable") for
             # the dashboard's sensor-health gauge - sensor_status above is
             # the same information as one display string, kept for the
             # existing badge rendering.
             "sysmon_state": sysmon_label,
             "etw_state": etw_label,
+            "kernel_state": kernel_label,
             # Events a sensor observed but had to discard because its bounded
             # queue was full (all time, this run) - the size of the visibility
             # hole behind a "lossy" state.
             "sysmon_dropped_events": self.sysmon_health.drops_total(),
             "etw_dropped_events": self.etw_health.drops_total(),
+            "kernel_dropped_events": self.kernel_health.drops_total(),
             # Aggregate visibility state (see sensor_health.compute_blind_state)
             # - HEALTHY/DEGRADED/PARTIALLY_BLIND/CRITICALLY_BLIND, driven by
             # telemetry integrity rather than just "is the process running".
