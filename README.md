@@ -27,6 +27,7 @@ one misses and whether fusion recovers them.
 
 * **Three fused sensors**: Sysmon (rich fields), ETW `Kernel-Process` (low latency, no Sysmon needed) and a WDM kernel driver (real process creator, LSASS handle requests, driver loads), correlated by PID.
 * **Sensors that audit each other**: if ETW and Sysmon disagree about a parent PID, it is logged as `[TELEMETRY_CONTRADICTION]` instead of silently resolved.
+* **Per-event tamper detection**: the kernel driver and ETW are two independent witnesses to every process creation. If one reports a creation the other never does, that is logged as `[SENSOR-BLINDSPOT]` within seconds (window plus one GC pass, about 10 s by default), well before the 60-second heartbeat watchdog would notice. Warning-only; it never scores or kills.
 * **Knows when it is blind**: sensor health reduces to `HEALTHY / DEGRADED / PARTIALLY_BLIND / CRITICALLY_BLIND`, and the dashboard qualifies its own "0 alerts" tiles when visibility is reduced.
 * **Scored response**: per-process score with decay; warning at 50, suspend and terminate at 80, behind a hardcoded protected-process floor.
 * **Self-protecting**: the driver strips terminate and injection rights from handles to the agent, so `taskkill /F` against it fails.
@@ -41,7 +42,7 @@ one misses and whether fusion recovers them.
 The agent works in four phases:
 
 1. **Collect**: Sysmon, ETW and the kernel driver each feed a bounded queue and a separate scoring thread, so a slow rule can never stall event delivery. The static scanner and a 30-second module sweep run alongside.
-2. **Correlate**: `ProcessCorrelator` merges ETW and Sysmon events for the same PID: ETW first as *provisional*, then *fused* with Sysmon's richer fields. Kernel events are dispatched independently and deduplicated per PID. A watchdog tracks every sensor's heartbeat and dropped events.
+2. **Correlate**: `ProcessCorrelator` merges ETW and Sysmon events for the same PID: ETW first as *provisional*, then *fused* with Sysmon's richer fields. Kernel events are dispatched independently and deduplicated per PID. A watchdog tracks every sensor's heartbeat and dropped events, and a witness check compares the kernel driver's and ETW's reports of each process creation (see [Witness-gap detection](docs/internals.md#witness-gap-detection-per-event-sensor-tamper-detection)).
 3. **Score**: every finding adds points through one choke point that enforces the protected-process floor, decay and PID-reuse guard. YAML rules score through the same path.
 4. **Respond and surface**: crossing a threshold triggers a forensic snapshot, and at 80 a suspend then terminate. Everything is shown on a local dashboard.
 
@@ -74,7 +75,7 @@ flowchart LR
 | Needs Sysmon installed | yes | no | no |
 
 ¹ Neither sees a non-elevated `OpenProcess` on LSASS: PPL rejects it before any callback runs.
-² ETW's event header carries the creating process (Fibratus and Velociraptor both use it), but this agent does not read it yet. That is a gap in this implementation, not an ETW limit; see the [comparison notes](docs/comparison.md#5-correction-to-this-projects-own-matrix).
+² ETW's event header carries the creating process (Fibratus and Velociraptor both use it). This agent now reads it and cross-checks it against the driver, but **scoring on it is off by default** until you have confirmed on your host that it matches the driver's real creator (see [Usage](#usage), step 7). Not yet verified live; see the [comparison notes](docs/comparison.md#5-correction-to-this-projects-own-matrix).
 
 ### Detections
 
@@ -177,11 +178,24 @@ To observe without any kill risk, comment out `self.mitigate(pid)` in
    python -m pytest
    ```
 
+7. **Verify the cross-sensor checks on your host** (agent running, driver loaded):
+   ```powershell
+   # after some normal activity: the ETW header creator should match the driver's real creator
+   (Invoke-RestMethod http://127.0.0.1:8787/api/summary).witness
+   #   creator_agreement.disagree should be ~0 before you set correlator.etw_creator_scoring: true
+
+   # blind ETW on purpose, then start any program
+   logman query -ets                      # find the GUID-named session the agent created
+   logman stop "<that-guid>" -ets
+   notepad.exe                            # within ~10 s: "[SENSOR-BLINDSPOT] ETW did not report ..."
+   ```
+   Restart the agent to restore ETW. Do this in a VM.
+
 Each sensor can fail to start independently; the rest keep working.
 
 ## Configuration
 
-* **Tunables** (decay, thresholds, ransomware window, correlator fuse window, self-test interval) live in [`config/detection.yml`](config/detection.yml). A missing file falls back to the built-in defaults.
+* **Tunables** (decay, thresholds, ransomware window, correlator fuse window, self-test interval) live in [`config/detection.yml`](config/detection.yml). A missing file falls back to the built-in defaults. The correlator section also controls `witness_check` (on), `witness_window_seconds` (5) and `etw_creator_scoring` (off).
 * **Custom rules**: any YAML file in `rules/custom/`, picked up on the next start:
   ```yaml
   id: custom_lolbin_from_appdata_roaming
@@ -211,7 +225,7 @@ Live-tested on a running agent with all three sensors up
 | Defender tamper command line | ✅ | ❌ | ❌ | +90, needs Sysmon |
 | Office → LOLBin | ✅ | ❌ | ❌ | +60, needs Sysmon |
 
-³ This agent does not read the creating PID from the ETW event header, which ETW provides; not yet re-tested with it.
+³ Recorded before the agent read the creating PID from the ETW event header, which ETW provides. It is read and cross-checked now, but scoring on it is off by default and the matrix has not been re-run with it.
 
 The "Sysmon stopped" cells for the last two rows were not run live. The matrix
 also records two scoring and fusion bugs it exposed and fixed.
@@ -235,7 +249,8 @@ and method: [docs/comparison.md](docs/comparison.md).
 What is **not** unique here: reading the real creator from the kernel, handle-rights
 self-protection and automated kill actions all exist elsewhere. What was not found
 in any project examined: fusion of independent sensors with their disagreement
-logged, sensor health that qualifies the alert counts, a published live-tested
+logged, per-event detection of a blinded sensor by cross-checking two witnesses,
+sensor health that qualifies the alert counts, a published live-tested
 blind-spot matrix, and an OSI-licensed project that includes the driver. Rule
 breadth, ecosystem, scale and maturity favour the established tools; this project
 does not try to replace them.

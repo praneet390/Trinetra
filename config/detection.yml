@@ -23,6 +23,16 @@ ransomware:
 # yet measured against real Sysmon-vs-ETW delivery lag on a live system.
 correlator:
   fuse_window_seconds: 2.0
+  # Log [SENSOR-BLINDSPOT] when the kernel driver and ETW disagree about
+  # whether a process was created (one saw it, the other never reported it
+  # within witness_window_seconds). Warning-only: never scores or kills.
+  witness_check: true
+  witness_window_seconds: 5.0
+  # Score a mismatch between the ETW event header's creating pid and the
+  # claimed parent as PPID spoofing. Leave false until /api/summary's
+  # witness.creator_agreement shows `agree` ~= everything and `disagree` ~= 0
+  # on this host - a spoof verdict can auto-terminate a process.
+  etw_creator_scoring: false
 
 # How often self_test.py's benign process-visibility/alert-pipeline check
 # runs, and how long it waits for each check to succeed before failing

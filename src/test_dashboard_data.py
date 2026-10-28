@@ -127,6 +127,22 @@ def test_category_counts_sorted_descending():
     assert counts["B"] == 1
 
 
+def test_sensor_blindspot_findings_get_their_own_category_and_beat_keyword_collisions():
+    # The message mentions "process"/"ETW"/"dropping events" and, like any
+    # first-match-wins rule set, must not be swallowed by a later category.
+    msg = ("[SENSOR-BLINDSPOT] ETW did not report a process creation that the kernel driver observed "
+           "(PID 4242, image evil.exe) - the ETW sensor may be blinded, stopped, dropping events at the OS "
+           "level, or lagging.")
+    assert categorize(msg) == "Sensor Visibility"
+    recovery = "[SENSOR-BLINDSPOT] ETW is reporting process creations again (3 unreported during the gap)"
+    assert categorize(recovery) == "Sensor Visibility"
+
+
+def test_sensor_blindspot_is_a_warning_not_a_critical_threat():
+    record = logging.LogRecord("x", logging.WARNING, "", 0, "[SENSOR-BLINDSPOT] ETW did not report ...", None, None)
+    assert severity_of(record) == "WARNING"
+
+
 if __name__ == "__main__":
     test_severity_of()
     test_categorize_first_match_wins()

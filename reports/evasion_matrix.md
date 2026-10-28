@@ -68,6 +68,11 @@ report.
 > are accurate for the code as tested; the "structural" wording applies to rows 4-5
 > only (no `CommandLine` / `ParentImage` field exists in the ETW payload). See
 > [`docs/comparison.md`](../docs/comparison.md#5-correction-to-this-projects-own-matrix).
+>
+> **Follow-up.** The agent now reads the ETW header's creating PID and
+> cross-checks it against the driver (scoring on it is off by default). Rows 1-2
+> have **not** been re-run with it, so their ETW cells above still describe the
+> earlier code.
 
 ## Row-by-row
 

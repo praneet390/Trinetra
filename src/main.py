@@ -9,7 +9,7 @@ from heuristic_engine import HeuristicEngine
 from module_inspector import ModuleInspector
 from process_correlator import ProcessCorrelator
 from rule_engine import RuleEngine
-from sensor_health import SensorHealth, watchdog_loop, current_blind_state
+from sensor_health import SensorHealth, watchdog_loop, current_blind_state, sensor_label
 from detection_config import load_config
 from self_test import RecentPidSightings, self_test_loop
 from process_tracker import ProcessTracker
@@ -53,7 +53,8 @@ def main():
     # depends on the other, plus a watchdog that observes (never
     # auto-restarts - see sensor_health.py) whether each is still alive.
     logging.info("[*] Starting Behavioral Telemetry Monitors...")
-    correlator = ProcessCorrelator(engine, fuse_window=config['correlator']['fuse_window_seconds'])
+    correlator = ProcessCorrelator(engine, fuse_window=config['correlator']['fuse_window_seconds'],
+                                   witness_window=config['correlator'].get('witness_window_seconds'))
     engine.correlator = correlator
     correlator.start()
 
@@ -74,6 +75,18 @@ def main():
     ensure_driver_running()
     kernel_handle = start_kernel_monitor(engine, correlator, on_heartbeat=kernel_health.touch,
                                          on_drop=kernel_health.record_drop)
+
+    # Per-event witness-gap check (see process_correlator.enable_witness_check):
+    # the kernel driver and ETW are two independent, unfiltered witnesses to
+    # every process creation, so one reporting a creation the other never
+    # does is tamper/blinding evidence. A sensor that never came up
+    # ('unavailable') or is already known to be dropping events ('lossy')
+    # explains its own silence, so only 'live'/'stale' count as unexplained.
+    if config['correlator'].get('witness_check', True):
+        witness_handles = {"etw": (etw_handle, etw_health), "kernel": (kernel_handle, kernel_health)}
+        correlator.enable_witness_check(
+            lambda name: sensor_label(*witness_handles[name]) in ("live", "stale")
+        )
 
     def _blind_state():
         # No dashboard is polling this CLI entrypoint, so the watchdog is

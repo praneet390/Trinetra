@@ -328,6 +328,378 @@ def test_gc_loop_runs_on_its_own_thread_via_start():
     assert threading.active_count() >= 1  # the gc_loop daemon thread is alive alongside the test thread
 
 
+# ---- ETW header creator pid -------------------------------------------------
+
+def test_submit_etw_carries_the_header_creator_on_the_dispatch():
+    engine = _FakeEngine()
+    correlator = pc.ProcessCorrelator(engine)
+    correlator.submit_etw(1234, 1, "evil.exe", "t", creator_pid=777)
+    assert engine.dispatches[0][1]['_etw_creator_pid'] == 777
+
+
+def test_submit_etw_normalizes_a_string_creator_pid_to_int():
+    engine = _FakeEngine()
+    correlator = pc.ProcessCorrelator(engine)
+    correlator.submit_etw(1234, 1, "evil.exe", "t", creator_pid="777")
+    assert engine.dispatches[0][1]['_etw_creator_pid'] == 777
+
+
+def test_submit_etw_omits_the_creator_key_when_absent_or_unusable():
+    # No key at all (not None) so every pre-existing consumer of the dispatch
+    # dict sees exactly what it always did.
+    for bad in (None, "", "abc", -1, True, 1.5e400):
+        engine = _FakeEngine()
+        pc.ProcessCorrelator(engine).submit_etw(1234, 1, "evil.exe", "t", creator_pid=bad)
+        assert '_etw_creator_pid' not in engine.dispatches[0][1], bad
+
+
+def test_creator_pid_accepts_only_exactly_integral_numbers():
+    assert pc._coerce_pid(7) == 7 and pc._coerce_pid("7") == 7 and pc._coerce_pid(7.0) == 7
+    assert pc._coerce_pid(0) == 0, "pid 0 is a real value, not 'unknown'"
+    for bad in (None, True, False, -1, 1.5, float('inf'), float('nan'), "", "x", "1.5", [], {}):
+        assert pc._coerce_pid(bad) is None, bad
+
+
+def test_an_overflowing_pid_does_not_raise_out_of_submit_etw():
+    engine = _FakeEngine()
+    pc.ProcessCorrelator(engine).submit_etw(float('inf'), 1, "evil.exe", "t")
+    assert len(engine.dispatches) == 1, "the event is still dispatched"
+
+
+def test_submit_etw_without_creator_dispatch_is_unchanged():
+    engine = _FakeEngine()
+    pc.ProcessCorrelator(engine).submit_etw(1234, 1, "evil.exe", "t")
+    assert set(engine.dispatches[0][1]) == {
+        'ProcessId', 'ParentProcessId', 'Image', 'CreateTime', 'ParentImage', 'CommandLine',
+        '_source', '_provisional', '_dedup_key',
+    }
+
+
+# ---- witness-gap detection --------------------------------------------------
+
+class _Clock:
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class _Captured:
+    """Context manager capturing the correlator's warning/info/error log calls
+    (same monkeypatch-the-logging-module pattern as the contradiction tests)."""
+
+    def __enter__(self):
+        self.warnings, self.infos, self.errors = [], [], []
+        self._saved = (pc.logging.warning, pc.logging.info, pc.logging.error)
+        pc.logging.warning = lambda msg, *a, **k: self.warnings.append(msg)
+        pc.logging.info = lambda msg, *a, **k: self.infos.append(msg)
+        pc.logging.error = lambda msg, *a, **k: self.errors.append(msg)
+        return self
+
+    def __exit__(self, *exc):
+        pc.logging.warning, pc.logging.info, pc.logging.error = self._saved
+
+    def blindspots(self):
+        return [w for w in self.warnings if pc.BLINDSPOT_TAG in w]
+
+
+def _armed(gate=lambda name: True, grace=0.0, window=5.0):
+    clock = _Clock()
+    correlator = pc.ProcessCorrelator(_FakeEngine(), witness_window=window, clock=clock)
+    correlator.enable_witness_check(gate, startup_grace=grace)
+    clock.advance(1.0)  # strictly after arming
+    return correlator, clock
+
+
+def test_kernel_only_creation_is_reported_as_an_etw_gap():
+    correlator, clock = _armed()
+    with _Captured() as log:
+        correlator.submit_kernel(1234, 1, 1, r"\Device\HarddiskVolume3\evil.exe", False)
+        clock.advance(5.0)
+        correlator._gc_once()
+    lines = log.blindspots()
+    assert len(lines) == 1
+    assert "ETW did not report" in lines[0] and "kernel driver" in lines[0]
+    assert "PID 1234" in lines[0] and "evil.exe" in lines[0]
+    stats = correlator.witness_stats()
+    assert stats['gaps'] == {'etw': 1, 'kernel': 0} and stats['active_gaps'] == ['etw']
+
+
+def test_etw_only_creation_is_reported_as_a_kernel_gap():
+    correlator, clock = _armed()
+    with _Captured() as log:
+        correlator.submit_etw(1234, 1, "evil.exe", "t")
+        clock.advance(5.0)
+        correlator._gc_once()
+    assert len(log.blindspots()) == 1 and "kernel driver did not report" in log.blindspots()[0]
+    assert correlator.witness_stats()['gaps'] == {'etw': 0, 'kernel': 1}
+
+
+def test_a_creation_both_sensors_reported_is_not_a_gap():
+    correlator, clock = _armed()
+    with _Captured() as log:
+        correlator.submit_etw(1234, 1, "evil.exe", "t")
+        correlator.submit_kernel(1234, 1, 1, "evil.exe", False)
+        clock.advance(5.0)
+        correlator._gc_once()
+    assert log.blindspots() == []
+    assert correlator.witness_stats()['gaps'] == {'etw': 0, 'kernel': 0}
+
+
+def test_nothing_is_judged_before_the_witness_window_elapses():
+    correlator, clock = _armed()
+    with _Captured() as log:
+        correlator.submit_kernel(1234, 1, 1, "evil.exe", False)
+        clock.advance(4.9)
+        correlator._gc_once()
+        assert log.blindspots() == [] and len(correlator._witness) == 1
+        # ...and the second witness can still arrive in time
+        correlator.submit_etw(1234, 1, "evil.exe", "t")
+        clock.advance(0.2)
+        correlator._gc_once()
+    assert log.blindspots() == [] and correlator._witness == {}
+
+
+def test_no_gap_is_reported_unless_the_check_was_armed():
+    clock = _Clock()
+    correlator = pc.ProcessCorrelator(_FakeEngine(), clock=clock)
+    with _Captured() as log:
+        correlator.submit_kernel(1234, 1, 1, "evil.exe", False)
+        clock.advance(10.0)
+        correlator._gc_once()
+    assert log.blindspots() == [] and correlator.witness_stats()['enabled'] is False
+
+
+def test_a_gate_that_explains_the_silence_suppresses_the_finding():
+    # e.g. the silent sensor is 'unavailable' or already known to be 'lossy'
+    seen = []
+
+    def gate(name):
+        seen.append(name)
+        return False
+
+    correlator, clock = _armed(gate=gate)
+    with _Captured() as log:
+        correlator.submit_kernel(1234, 1, 1, "evil.exe", False)
+        clock.advance(5.0)
+        correlator._gc_once()
+    assert seen == ['etw'], "the gate is asked about the SILENT sensor"
+    assert log.blindspots() == [] and correlator.witness_stats()['gaps'] == {'etw': 0, 'kernel': 0}
+
+
+def test_a_gate_that_raises_is_treated_as_explained_and_logged():
+    def gate(name):
+        raise RuntimeError("boom")
+
+    correlator, clock = _armed(gate=gate)
+    with _Captured() as log:
+        correlator.submit_kernel(1234, 1, 1, "evil.exe", False)
+        clock.advance(5.0)
+        correlator._gc_once()
+    assert log.blindspots() == []
+    assert any("Witness gate failed" in e for e in log.errors)
+
+
+def test_creations_during_the_startup_grace_period_are_ignored():
+    correlator, clock = _armed(grace=10.0)   # armed at t=1000, clock now 1001
+    with _Captured() as log:
+        correlator.submit_kernel(1, 0, 0, "early.exe", False)       # t=1001: inside grace
+        clock.advance(10.0)
+        correlator.submit_kernel(2, 0, 0, "later.exe", False)       # t=1011: grace over
+        clock.advance(5.0)
+        correlator._gc_once()
+    lines = log.blindspots()
+    assert len(lines) == 1 and "PID 2" in lines[0]
+
+
+def test_a_sustained_gap_logs_once_then_an_aggregate_per_interval():
+    correlator, clock = _armed()
+    with _Captured() as log:
+        for pid in (10, 11, 12):
+            correlator.submit_kernel(pid, 1, 1, f"p{pid}.exe", False)
+        clock.advance(5.0)
+        correlator._gc_once()
+        assert len(log.blindspots()) == 1, "first gap logs immediately, the rest are counted"
+        assert correlator.witness_stats()['gaps']['etw'] == 3
+
+        clock.advance(pc.GAP_SUMMARY_INTERVAL_SECONDS)
+        correlator.submit_kernel(13, 1, 1, "p13.exe", False)
+        clock.advance(5.0)
+        correlator._gc_once()
+    lines = log.blindspots()
+    assert len(lines) == 2 and "still missing" in lines[1] and "3 more" in lines[1], lines
+    assert correlator.witness_stats()['gaps']['etw'] == 4
+
+
+def test_recovery_is_logged_once_when_both_sensors_report_again():
+    correlator, clock = _armed()
+    with _Captured() as log:
+        correlator.submit_kernel(10, 1, 1, "a.exe", False)
+        clock.advance(5.0)
+        correlator._gc_once()
+        assert correlator.witness_stats()['active_gaps'] == ['etw']
+
+        correlator.submit_etw(11, 1, "b.exe", "t")
+        correlator.submit_kernel(11, 1, 1, "b.exe", False)
+        clock.advance(5.0)
+        correlator._gc_once()
+        # a second healthy creation must not log recovery again
+        correlator.submit_etw(12, 1, "c.exe", "t")
+        correlator.submit_kernel(12, 1, 1, "c.exe", False)
+        clock.advance(5.0)
+        correlator._gc_once()
+    recoveries = [i for i in log.infos if "reporting process creations again" in i]
+    assert len(recoveries) == 1 and "ETW" in recoveries[0] and "1 unreported" in recoveries[0]
+    assert correlator.witness_stats()['active_gaps'] == []
+
+
+def test_a_late_second_witness_is_not_misread_as_the_opposite_gap():
+    # Kernel reports at t0; ETW's event only turns up after the window has
+    # already been judged. That must yield ONE ETW-gap finding - not a second,
+    # bogus "kernel did not report" from ETW's late event opening a new record.
+    correlator, clock = _armed()
+    with _Captured() as log:
+        correlator.submit_kernel(1234, 1, 1, "evil.exe", False)
+        clock.advance(6.0)
+        correlator._gc_once()                      # judged: ETW gap
+        correlator.submit_etw(1234, 1, "evil.exe", "t")   # late arrival
+        clock.advance(6.0)
+        correlator._gc_once()
+    assert correlator.witness_stats()['gaps'] == {'etw': 1, 'kernel': 0}
+    assert len(log.blindspots()) == 1
+
+
+def test_a_reused_pid_long_after_the_window_is_a_new_creation():
+    correlator, clock = _armed()
+    with _Captured():
+        correlator.submit_kernel(1234, 1, 1, "first.exe", False)
+        clock.advance(5.0)
+        correlator._gc_once()
+        clock.advance(2 * 5.0)                      # past the late-arrival memory
+        correlator.submit_kernel(1234, 1, 1, "second.exe", False)
+        clock.advance(5.0)
+        correlator._gc_once()
+    assert correlator.witness_stats()['gaps']['etw'] == 2
+
+
+def test_int_and_string_pids_are_the_same_creation():
+    correlator, clock = _armed()
+    with _Captured() as log:
+        correlator.submit_etw("1234", "1", "evil.exe", "t")   # pywintrace hands over strings
+        correlator.submit_kernel(1234, 1, 1, "evil.exe", False)
+        clock.advance(5.0)
+        correlator._gc_once()
+    assert log.blindspots() == []
+
+
+def test_an_event_with_no_usable_pid_never_fabricates_a_gap():
+    correlator, clock = _armed()
+    with _Captured() as log:
+        correlator.submit_etw(None, 1, "evil.exe", "t")
+        correlator.submit_etw("garbage", 1, "evil.exe", "t")
+        clock.advance(5.0)
+        correlator._gc_once()
+    assert correlator._witness == {} and log.blindspots() == []
+
+
+def test_witness_records_are_bounded_and_evict_the_oldest():
+    original = pc.MAX_WITNESS_RECORDS
+    pc.MAX_WITNESS_RECORDS = 3
+    try:
+        correlator, clock = _armed()
+        for pid in range(1, 6):
+            correlator.submit_kernel(pid, 1, 1, f"p{pid}.exe", False)
+            clock.advance(0.01)
+        assert list(correlator._witness) == [3, 4, 5]
+        clock.advance(10.0)
+        with _Captured():
+            correlator._gc_once()
+        assert len(correlator._closed) <= 3
+    finally:
+        pc.MAX_WITNESS_RECORDS = original
+
+
+def test_creator_agreement_counts_only_creations_with_both_creators_known():
+    correlator, clock = _armed()
+    with _Captured():
+        correlator.submit_etw(1, 0, "a.exe", "t", creator_pid=50)
+        correlator.submit_kernel(1, 0, 50, "a.exe", False)          # agree
+        correlator.submit_etw(2, 0, "b.exe", "t", creator_pid=50)
+        correlator.submit_kernel(2, 0, 60, "b.exe", False)          # disagree
+        correlator.submit_etw(3, 0, "c.exe", "t")                   # no ETW creator
+        correlator.submit_kernel(3, 0, 50, "c.exe", False)
+        correlator.submit_etw(4, 0, "d.exe", "t", creator_pid=50)   # kernel never reported
+        clock.advance(5.0)
+        correlator._gc_once()
+    assert correlator.witness_stats()['creator_agreement'] == {'agree': 1, 'disagree': 1}
+
+
+def test_creator_agreement_is_counted_even_when_the_gap_check_is_not_armed():
+    clock = _Clock()
+    correlator = pc.ProcessCorrelator(_FakeEngine(), clock=clock)
+    correlator.submit_etw(1, 0, "a.exe", "t", creator_pid=50)
+    correlator.submit_kernel(1, 0, 50, "a.exe", False)
+    clock.advance(5.0)
+    correlator._gc_once()
+    assert correlator.witness_stats()['creator_agreement'] == {'agree': 1, 'disagree': 0}
+
+
+def test_a_witness_failure_cannot_stop_pending_records_being_dispatched():
+    engine = _FakeEngine()
+    correlator = pc.ProcessCorrelator(engine, fuse_window=0.01)
+    correlator.submit_sysmon({'ProcessId': 1234, 'Image': 'evil.exe'}, "t")
+    time.sleep(0.02)
+
+    def boom():
+        raise RuntimeError("witness exploded")
+
+    correlator._gc_witness = boom
+    with _Captured() as log:
+        correlator._gc_once()
+    assert len(engine.dispatches) == 1 and engine.dispatches[0][1]['_source'] == 'sysmon'
+    assert any("Witness GC failed" in e for e in log.errors)
+
+
+def test_the_gate_runs_without_the_correlator_lock_held():
+    held = []
+    holder = {}
+
+    def gate(name):
+        acquired = holder['correlator']._lock.acquire(blocking=False)
+        if acquired:
+            holder['correlator']._lock.release()
+        held.append(not acquired)
+        return True
+
+    correlator, clock = _armed(gate=gate)
+    holder['correlator'] = correlator
+    with _Captured():
+        correlator.submit_kernel(1234, 1, 1, "evil.exe", False)
+        clock.advance(5.0)
+        correlator._gc_once()
+    assert held == [False]
+
+
+def test_witness_window_rejects_nonsense_values():
+    for bad in (0, -3, "5", None, True, float('nan')):
+        c = pc.ProcessCorrelator(_FakeEngine(), witness_window=bad)
+        assert c.witness_window == pc.DEFAULT_WITNESS_WINDOW_SECONDS, bad
+    assert pc.ProcessCorrelator(_FakeEngine(), witness_window=7.5).witness_window == 7.5
+
+
+def test_witness_stats_shape():
+    correlator, _ = _armed()
+    stats = correlator.witness_stats()
+    assert stats == {
+        'enabled': True, 'window_seconds': 5.0, 'gaps': {'etw': 0, 'kernel': 0},
+        'active_gaps': [], 'creator_agreement': {'agree': 0, 'disagree': 0},
+    }
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for t in tests:

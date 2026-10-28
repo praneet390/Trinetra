@@ -86,7 +86,9 @@ monitoring. It is source-available rather than open source.
 **Not found in any of the sources examined:**
 
 1. A correlator fusing **independent** behavioral sensors (Sysmon, ETW and an
-   own driver), with the disagreement between them logged as a finding.
+   own driver), with the disagreement between them logged as a finding, and
+   per-event detection of a blinded sensor by checking that two unfiltered
+   witnesses (kernel driver, ETW) both report each process creation.
 2. Sensor health reduced to an aggregate visibility state that qualifies the
    alert counts themselves.
 3. A published, live-tested matrix of which technique each sensor does and does
@@ -106,8 +108,16 @@ creating process from the ETW **event header** (`Header.ProcessID` /
 `Microsoft-Windows-Kernel-Process` provider. `src/etw_monitor.py` already reads
 `event["EventHeader"]` but never reads the header's `ProcessId`. So the "N" for
 ETW in the PPID-spoof rows reflects what this implementation extracts, **not a
-limit of ETW**. This has not been tested live here: confirming it, and wiring the
-header PID into the ETW path, is the obvious next change.
+limit of ETW**.
+
+**Status (implemented, not yet verified live).** `etw_monitor.py` now reads
+`EventHeader.ProcessId` (key confirmed against pywintrace 0.2.0's source), the
+correlator compares it with the kernel driver's real creator and exposes
+agree/disagree counts on `/api/summary`, and the engine can score a mismatch
+with the claimed parent, **off by default** (`correlator.etw_creator_scoring`)
+until the counters confirm the header means "creator" on the exact provider
+this agent consumes. Fibratus and Velociraptor's use of the header is the
+evidence it does; it is not a substitute for running it.
 
 ## Method and limits
 

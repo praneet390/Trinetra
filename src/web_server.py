@@ -346,7 +346,8 @@ class Backend:
         self._sysmon_handle = None
         self._etw_handle = None
         self._kernel_handle = None
-        self.correlator = ProcessCorrelator(self.engine, fuse_window=self.config['correlator']['fuse_window_seconds'])
+        self.correlator = ProcessCorrelator(self.engine, fuse_window=self.config['correlator']['fuse_window_seconds'],
+                                            witness_window=self.config['correlator'].get('witness_window_seconds'))
         self.engine.correlator = self.correlator
         self.sysmon_health = SensorHealth("sysmon")
         self.etw_health = SensorHealth("etw")
@@ -400,6 +401,10 @@ class Backend:
                                                     on_heartbeat=self.kernel_health.touch,
                                                     on_drop=self.kernel_health.record_drop)
 
+        # Per-event witness-gap check (see process_correlator.enable_witness_check).
+        if self.config['correlator'].get('witness_check', True):
+            self.correlator.enable_witness_check(self._witness_gate)
+
         threading.Thread(
             target=watchdog_loop,
             args=([self.sysmon_health, self.etw_health, self.kernel_health],),
@@ -441,6 +446,17 @@ class Backend:
         while True:
             time.sleep(MODULE_SWEEP_INTERVAL_SECONDS)
             self.inspector.sweep()
+
+    def _witness_gate(self, sensor_name):
+        """True when `sensor_name` ('etw' or 'kernel') staying silent about a
+        process creation the other one reported is UNEXPLAINED. A sensor
+        that never came up ('unavailable') or is already known to be
+        dropping events ('lossy') explains its own silence, so only
+        'live'/'stale' count. Read fresh on every call (handles are set in
+        start())."""
+        handle, health = ((self._etw_handle, self.etw_health) if sensor_name == "etw"
+                          else (self._kernel_handle, self.kernel_health))
+        return sensor_label(handle, health) in ("live", "stale")
 
     def _blind_state(self):
         """Aggregate visibility state across both behavioral sensors (see
@@ -493,6 +509,11 @@ class Backend:
             "sysmon_dropped_events": self.sysmon_health.drops_total(),
             "etw_dropped_events": self.etw_health.drops_total(),
             "kernel_dropped_events": self.kernel_health.drops_total(),
+            # Per-event cross-check between the kernel driver and ETW (see
+            # process_correlator.witness_stats): gap counts per sensor, the
+            # sensors currently silent, and how often the ETW-header creator
+            # agreed with the driver's real creator.
+            "witness": self.correlator.witness_stats(),
             # Aggregate visibility state (see sensor_health.compute_blind_state)
             # - HEALTHY/DEGRADED/PARTIALLY_BLIND/CRITICALLY_BLIND, driven by
             # telemetry integrity rather than just "is the process running".

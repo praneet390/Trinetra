@@ -26,11 +26,18 @@ class _FakeScanner:
 
 
 class _FakeCorrelator:
+    last = None
+
     def __init__(self, *args, **kwargs):
-        pass
+        self.init_kwargs = kwargs
+        self.gate = None
+        _FakeCorrelator.last = self
 
     def start(self):
         pass
+
+    def enable_witness_check(self, gate, **kwargs):
+        self.gate = gate
 
 
 def _run_main(loop_error, session):
@@ -82,6 +89,23 @@ def test_an_unexpected_error_in_the_main_loop_still_releases_the_etw_session():
     boom = RuntimeError("module sweep exploded")
     assert _run_main(boom, session) is boom, "the error must still propagate"
     assert session.stop_calls == 1
+
+
+def test_main_arms_the_witness_check_and_only_trusts_live_or_stale_sensors():
+    # A sensor that is up (here: ETW, never heartbeated -> 'stale') staying
+    # silent is unexplained; one that never came up ('unavailable', here the
+    # kernel driver, which cannot load off-Windows) explains its own silence.
+    assert _run_main(KeyboardInterrupt(), _FakeSession()) is None
+    gate = _FakeCorrelator.last.gate
+    assert gate is not None
+    assert gate("etw") is True
+    assert gate("kernel") is False
+    assert _FakeCorrelator.last.init_kwargs["witness_window"] == 5.0
+
+
+def test_main_gate_treats_an_etw_sensor_that_never_started_as_explained():
+    assert _run_main(KeyboardInterrupt(), None) is None
+    assert _FakeCorrelator.last.gate("etw") is False
 
 
 def test_ctrl_c_is_clean_when_the_etw_sensor_never_started():

@@ -297,6 +297,50 @@ access, command-line and parent-image blind spots, self-protection, and the
 comms channel). They use documented Win32 APIs only and take no destructive
 action.
 
+### Witness-gap detection: per-event sensor-tamper detection
+
+The heartbeat watchdog only notices a sensor after `stale_after` (60s) of
+silence, so a sensor blinded for a short window while an attacker works is
+never flagged. The correlator closes that gap per event.
+
+The kernel driver and ETW `Kernel-Process` are two independent, **unfiltered**
+witnesses to every process creation. `ProcessCorrelator` keeps a bounded record
+per PID of which of them reported it. When a record is older than
+`witness_window_seconds` (5s) and only one reported, the silent one is logged:
+
+```
+[SENSOR-BLINDSPOT] ETW did not report a process creation that the kernel driver observed
+(PID 4242, image ...) - the ETW sensor may be blinded, stopped, dropping events at the OS
+level, or lagging. Process visibility is reduced until it reports again.
+```
+
+Detection latency is the window plus up to one GC interval (5s), so about 10s by
+default.
+
+**False-positive controls.** The check only reports an *unexplained* silence.
+`web_server.py` and `main.py` pass a gate that returns true only for a sensor
+that is `live` or `stale`: a sensor that never came up (`unavailable`) or is
+already known to be dropping events (`lossy`) explains its own silence. Further:
+
+* creations in the first 10s after arming are ignored (sensors start at slightly different times);
+* a witness arriving after its record was already judged is a late arrival and is ignored, so lag cannot produce a second, opposite finding;
+* a sustained gap logs once, then one aggregate line per 60s, and recovery is logged once;
+* events with no usable pid are ignored; both tables are bounded.
+
+**What it is not.** Sysmon is not a witness: its config excludes images on
+purpose and its delivery lag is unmeasured. The finding never scores or
+mitigates anything; it is a visibility finding. It cannot say *why* a sensor was
+silent. If both witnesses are silent, only the heartbeat watchdog sees it. A PID
+reused within the window merges two processes into one record. ETW-level buffer
+loss, which `SensorHealth` does not track, shows up here as a gap, which is
+accurate: the sensor really did miss the event.
+
+**Creator agreement.** Records where both sensors reported also compare the ETW
+event header's creating PID with the driver's real creator. The counts are on
+`/api/summary` under `witness.creator_agreement`. This is the live evidence for
+whether the header means "creator" on this provider, and the gate for turning
+on `correlator.etw_creator_scoring`.
+
 ### Self-test: proving the pipeline, not just the process
 
 `sensor_health.py`'s heartbeat/blind-state tracking proves a sensor's
