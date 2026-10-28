@@ -2,16 +2,16 @@
 
 # Windows Defensive Agent
 
-**An open-source Windows EDR that treats sensor blind spots as detection signals.**
+**An open-source Windows EDR built on one idea: sensors disagree, and that disagreement is a signal.**
 
-Sysmon · raw ETW · custom kernel driver — fused into one scored engine.
+Sysmon · raw ETW · custom kernel driver — fused, scored, and tested against their own failure modes.
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D4)
 ![Python](https://img.shields.io/badge/python-3.11%2B-3776AB)
 ![Driver](https://img.shields.io/badge/kernel%20driver-WDM-5C2D91)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-[Quick start](#-quick-start) · [How it works](#-how-it-works) · [Evasion matrix](#-evasion-matrix) · [Dashboard](#-dashboard) · [Deep dive](docs/internals.md)
+[What's different](#whats-different) · [Compared to](#how-it-compares) · [How it works](#how-it-works) · [Evasion matrix](#evasion-matrix) · [Quick start](#quick-start) · [Deep dive](docs/internals.md)
 
 </div>
 
@@ -27,6 +27,59 @@ from a kernel driver.
 This agent runs all three sensors at once and asks: *which attacks does each
 one miss, and does fusion recover them?* The answers are measured, not assumed
 — see the [evasion matrix](reports/evasion_matrix.md).
+
+## What's different
+
+Most endpoint tools are judged on what they detect. This one is also built to
+be judged on **what it can't see, and whether it knows that**.
+
+1. **Blind spots are mapped, not hidden.** Each sensor's structural gaps are
+   documented, each attack harness in `driver/sensor/` is run against the live
+   agent, and the results — including a wrong prediction and a technique *no*
+   sensor catches — are published in the [evasion matrix](reports/evasion_matrix.md).
+2. **It knows when it's blind.** Sensor health reduces to
+   `HEALTHY / DEGRADED / PARTIALLY_BLIND / CRITICALLY_BLIND`, and the dashboard
+   qualifies its own "0 alerts" tiles when visibility is reduced. Dropped events
+   are counted and malformed telemetry can't fake a heartbeat.
+3. **Its reaction to failure is tested.** A software-only
+   [failure-injection lab](docs/internals.md#failure-injection-lab-proving-the-reaction-not-just-the-happy-path)
+   and a live-VM harness break sensors on purpose and measure detection time,
+   fallback and recovery. They found four real bugs, since fixed.
+4. **It defends itself.** The driver strips terminate and injection rights from
+   handles to the agent, so `taskkill /F` against it fails.
+5. **Safety is engineered, not assumed.** A protected-process floor is enforced
+   in both Python and the driver, and every false positive that ever killed a
+   real process (an IDE, Outlook, and a full OS freeze) is documented with its fix.
+6. **Evidence outlives the process.** An ancestry graph is captured the first
+   time a PID crosses a threshold and kept after it dies, and dwell time is
+   computed from the agent's own first-observation record rather than guessed
+   from log timestamps.
+7. **It's small enough to read.** Driver, agent, rules and dashboard in one
+   MIT-licensed repo, with the reasoning written down next to the code.
+
+## How it compares
+
+This is a comparison of **focus**, not a claim of superiority. Established tools
+are far broader than this one; the point is where this project is different.
+
+| | Primary focus | Real-time response | Own kernel sensor | Publishes its blind spots |
+|---|---|:-:|:-:|:-:|
+| **This project** | Multi-sensor fusion, visibility integrity | ✅ suspend + terminate | ✅ | ✅ published matrix + health states |
+| [Sysmon](https://learn.microsoft.com/sysinternals/downloads/sysmon) | Telemetry source | ❌ | Microsoft's driver | — |
+| [Fibratus](https://github.com/rabbitstack/fibratus) | ETW-based detection engine, large rule catalog | — | — (ETW-based) | — |
+| [Velociraptor](https://github.com/Velocidex/velociraptor) | Hunting and forensics (VQL) | — | — | — |
+| [Wazuh](https://github.com/wazuh/wazuh) | Log analysis, FIM, SIEM | — | — | — |
+| [ClamAV](https://github.com/Cisco-Talos/clamav) | Signature-based file scanning | — | — | — |
+
+"—" means not verified or not applicable, so no claim is made. Rule breadth, ecosystem, scale and maturity all
+favour the established tools; this project does not try to replace them.
+
+The kernel-verified parent check is **not new on its own**: Elastic's endpoint
+sensor documents the same real-vs-reported parent comparison in its
+[Parent Process PID Spoofing rule](https://www.elastic.co/guide/en/security/8.19/prebuilt-rule-8-19-34-parent-process-pid-spoofing.html).
+What this repo adds is a small, readable implementation you can run and modify,
+the cross-sensor treatment around it, and the measured evidence of where each
+sensor stops.
 
 ## Features
 
@@ -259,13 +312,6 @@ data/       binaries.json, known_imphashes.json
 reports/    malware write-ups, evasion_matrix.md
 docs/       internals.md (full design notes)
 ```
-
-## Credits
-
-Detection ideas from [Fibratus](https://github.com/rabbitstack/fibratus) and
-[System Informer](https://github.com/winsiderss/systeminformer); ETW capture via
-[pywintrace](https://github.com/fireeye/pywintrace); threat intel from
-[MalwareBazaar](https://bazaar.abuse.ch). No code was copied.
 
 ## License
 
