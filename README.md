@@ -216,30 +216,6 @@ Live-tested on a running agent with all three sensors up
 The "Sysmon stopped" cells for the last two rows were not run live. The matrix
 also records two scoring and fusion bugs it exposed and fixed.
 
-## How it compares
-
-Read from each project's source on 2026-10-28; "not found" means a targeted
-search of the tree found nothing, not proof of absence. Evidence, commit hashes
-and method: [docs/comparison.md](docs/comparison.md).
-
-| | License | Own Windows kernel driver | Automated response | Real-vs-claimed parent | Agent self-protection | Multi-sensor fusion + health states |
-|---|---|:-:|---|---|:-:|:-:|
-| **This project** | MIT | ✅ | ✅ suspend + terminate | ✅ driver | ✅ | ✅ |
-| [Fibratus](https://github.com/rabbitstack/fibratus) | Apache-2.0 | not found (ETW) | ✅ `kill`, `isolate` | ✅ `real_ppid` (ETW header) | not found | not found |
-| [OpenEDR](https://github.com/ComodoSecurity/openedr) | CASL (source-available) | ✅ | not found | ✅ driver | ✅ | not found |
-| [Velociraptor](https://github.com/Velocidex/velociraptor) | AGPL-3.0 | not found | partial (network quarantine) | partial | not found | not found |
-| [Wazuh](https://github.com/wazuh/wazuh) | GPL-2.0 | not found | framework; no Windows kill script shipped | not found | not found | agent-level only |
-| [osquery](https://github.com/osquery/osquery) | Apache-2.0 / GPL-2.0 | not found | not found | not found | not found | not found |
-| [ClamAV](https://github.com/Cisco-Talos/clamav) | GPL-2.0 | not found | n/a (scanner) | n/a | not found | not found |
-
-What is **not** unique here: reading the real creator from the kernel, handle-rights
-self-protection and automated kill actions all exist elsewhere. What was not found
-in any project examined: fusion of independent sensors with their disagreement
-logged, sensor health that qualifies the alert counts, a published live-tested
-blind-spot matrix, and an OSI-licensed project that includes the driver. Rule
-breadth, ecosystem, scale and maturity favour the established tools; this project
-does not try to replace them.
-
 ## Project layout
 
 ```
