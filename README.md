@@ -19,9 +19,9 @@ Sysmon · raw ETW · custom kernel driver — fused, scored, and tested against 
 
 ## Why
 
-Every Windows telemetry source lies by omission. Sysmon and ETW only report a
-process's **claimed** parent, so parent-PID spoofing walks past them. ETW and
-the driver carry **no command line**. PPL hides some LSASS handle requests even
+Every Windows telemetry source lies by omission. Sysmon reports only a
+process's **claimed** parent, so parent-PID spoofing walks past it. ETW and the
+driver carry **no command line**. PPL hides some LSASS handle requests even
 from a kernel driver.
 
 This agent runs all three sensors at once and asks: *which attacks does each
@@ -31,55 +31,48 @@ one miss, and does fusion recover them?* The answers are measured, not assumed
 ## What's different
 
 Most endpoint tools are judged on what they detect. This one is also built to
-be judged on **what it can't see, and whether it knows that**.
+be judged on **what it can't see, and whether it knows that**. After reading the
+source of six comparable projects ([details](docs/comparison.md)), these are the
+things I did **not** find elsewhere:
 
-1. **Blind spots are mapped, not hidden.** Each sensor's structural gaps are
-   documented, each attack harness in `driver/sensor/` is run against the live
-   agent, and the results — including a wrong prediction and a technique *no*
-   sensor catches — are published in the [evasion matrix](reports/evasion_matrix.md).
+1. **Fusion of independent sensors.** Sysmon, ETW and an own kernel driver run
+   side by side through a correlator, and disagreement between them (e.g. two
+   sensors reporting different parents) is logged as a finding.
 2. **It knows when it's blind.** Sensor health reduces to
    `HEALTHY / DEGRADED / PARTIALLY_BLIND / CRITICALLY_BLIND`, and the dashboard
    qualifies its own "0 alerts" tiles when visibility is reduced. Dropped events
    are counted and malformed telemetry can't fake a heartbeat.
-3. **Its reaction to failure is tested.** A software-only
+3. **Blind spots are measured and published.** Each attack harness in
+   `driver/sensor/` was run against the live agent and the results — including a
+   wrong prediction and a technique *no* sensor catches — are in the
+   [evasion matrix](reports/evasion_matrix.md). A software-only
    [failure-injection lab](docs/internals.md#failure-injection-lab-proving-the-reaction-not-just-the-happy-path)
-   and a live-VM harness break sensors on purpose and measure detection time,
-   fallback and recovery. They found four real bugs, since fixed.
-4. **It defends itself.** The driver strips terminate and injection rights from
-   handles to the agent, so `taskkill /F` against it fails.
-5. **Safety is engineered, not assumed.** A protected-process floor is enforced
-   in both Python and the driver, and every false positive that ever killed a
-   real process (an IDE, Outlook, and a full OS freeze) is documented with its fix.
-6. **Evidence outlives the process.** An ancestry graph is captured the first
-   time a PID crosses a threshold and kept after it dies, and dwell time is
-   computed from the agent's own first-observation record rather than guessed
-   from log timestamps.
-7. **It's small enough to read.** Driver, agent, rules and dashboard in one
-   MIT-licensed repo, with the reasoning written down next to the code.
+   tests the agent's reaction to a dying sensor and found four real bugs.
+4. **MIT-licensed, driver included.** The closest relative with a kernel driver,
+   OpenEDR, is source-available under a custom license.
+
+**Not unique, and not claimed as such:** reading the real creator from the
+kernel (Fibratus, OpenEDR, Elastic), handle-rights self-protection (OpenEDR),
+automated kill actions (Fibratus). Those are in the comparison below.
 
 ## How it compares
 
-This is a comparison of **focus**, not a claim of superiority. Established tools
-are far broader than this one; the point is where this project is different.
+Read from each project's source on 2026-10-28; "not found" means a targeted
+search of the tree found nothing, not proof of absence. Full evidence, commit
+hashes and method: [docs/comparison.md](docs/comparison.md).
 
-| | Primary focus | Real-time response | Own kernel sensor | Publishes its blind spots |
-|---|---|:-:|:-:|:-:|
-| **This project** | Multi-sensor fusion, visibility integrity | ✅ suspend + terminate | ✅ | ✅ published matrix + health states |
-| [Sysmon](https://learn.microsoft.com/sysinternals/downloads/sysmon) | Telemetry source | ❌ | Microsoft's driver | — |
-| [Fibratus](https://github.com/rabbitstack/fibratus) | ETW-based detection engine, large rule catalog | — | — (ETW-based) | — |
-| [Velociraptor](https://github.com/Velocidex/velociraptor) | Hunting and forensics (VQL) | — | — | — |
-| [Wazuh](https://github.com/wazuh/wazuh) | Log analysis, FIM, SIEM | — | — | — |
-| [ClamAV](https://github.com/Cisco-Talos/clamav) | Signature-based file scanning | — | — | — |
+| | License | Own Windows kernel driver | Automated response | Real-vs-claimed parent | Agent self-protection | Multi-sensor fusion + health states |
+|---|---|:-:|---|---|:-:|:-:|
+| **This project** | MIT | ✅ | ✅ suspend + terminate | ✅ driver | ✅ | ✅ |
+| [Fibratus](https://github.com/rabbitstack/fibratus) | Apache-2.0 | not found (ETW) | ✅ `kill`, `isolate` | ✅ `real_ppid` (ETW header) | not found | not found |
+| [OpenEDR](https://github.com/ComodoSecurity/openedr) | CASL (source-available) | ✅ | not found | ✅ driver | ✅ | not found |
+| [Velociraptor](https://github.com/Velocidex/velociraptor) | AGPL-3.0 | not found | partial (network quarantine) | partial | not found | not found |
+| [Wazuh](https://github.com/wazuh/wazuh) | GPL-2.0 | not found | framework; no Windows kill script shipped | not found | not found | agent-level only |
+| [osquery](https://github.com/osquery/osquery) | Apache-2.0 / GPL-2.0 | not found | not found | not found | not found | not found |
+| [ClamAV](https://github.com/Cisco-Talos/clamav) | GPL-2.0 | not found | n/a (scanner) | n/a | not found | not found |
 
-"—" means not verified or not applicable, so no claim is made. Rule breadth, ecosystem, scale and maturity all
-favour the established tools; this project does not try to replace them.
-
-The kernel-verified parent check is **not new on its own**: Elastic's endpoint
-sensor documents the same real-vs-reported parent comparison in its
-[Parent Process PID Spoofing rule](https://www.elastic.co/guide/en/security/8.19/prebuilt-rule-8-19-34-parent-process-pid-spoofing.html).
-What this repo adds is a small, readable implementation you can run and modify,
-the cross-sensor treatment around it, and the measured evidence of where each
-sensor stops.
+Rule breadth, ecosystem, scale and maturity all favour the established tools —
+Fibratus alone ships 134 rule files — and this project does not try to replace them.
 
 ## Features
 
@@ -121,12 +114,13 @@ flowchart LR
 | Command line | ✅ | ❌ | ❌ |
 | Parent image path | ✅ | ❌ | ❌ |
 | Claimed parent PID | ✅ | ✅ | ✅ |
-| **Real** creator PID | ❌ | ❌ | ✅ |
+| **Real** creator PID | ❌ | ⚠️ ² | ✅ |
 | LSASS handle requests | ✅ ¹ | ❌ | ✅ ¹ |
 | Kernel driver loads | ❌ | ❌ | ✅ |
 | Needs Sysmon installed | yes | no | no |
 
 ¹ Neither sees a non-elevated `OpenProcess` on LSASS: PPL rejects it before any callback runs.
+² ETW's event header carries the creating process (Fibratus and Velociraptor both use it), but this agent does not read it yet. A gap in this implementation, not an ETW limit — see [comparison](docs/comparison.md#5-correction-to-this-projects-own-matrix).
 
 If ETW and Sysmon disagree about a parent PID, the correlator logs
 `[TELEMETRY_CONTRADICTION]` instead of silently picking one.
@@ -257,11 +251,13 @@ Live-tested on a running agent with all three sensors up
 
 | Technique | Sysmon | ETW | Kernel | Result |
 |---|:-:|:-:|:-:|---|
-| PPID spoof, untrusted creator | ❌ | ❌ | ✅ | +80, caught only by the driver |
-| PPID spoof, trusted System32 broker | ❌ | ❌ | ✅ | +20, logged but not killed |
+| PPID spoof, untrusted creator | ❌ | ❌ ³ | ✅ | +80, caught only by the driver |
+| PPID spoof, trusted System32 broker | ❌ | ❌ ³ | ✅ | +20, logged but not killed |
 | `OpenProcess(VM_READ)` on LSASS, non-elevated | ❌ | n/a | ❌ | **nothing sees it** (PPL) |
 | Defender tamper command line | ✅ | ❌ | ❌ | +90, needs Sysmon |
 | Office → LOLBin | ✅ | ❌ | ❌ | +60, needs Sysmon |
+
+³ This agent doesn't read the creating PID from the ETW event header, which ETW provides; not yet re-tested with it.
 
 The "Sysmon stopped" cells for the last two rows were not run live. The matrix
 also records two scoring and fusion bugs it exposed and fixed.
@@ -285,6 +281,7 @@ and never executes a sample.
 - The driver is **test-signed**, not attestation- or ELAM-signed, and uses a
   placeholder `ObRegisterCallbacks` altitude. It can't stop an admin's `sc stop`.
 - No sensor sees a non-elevated `OpenProcess` on LSASS.
+- The ETW path ignores the event header's creating PID, so only the driver catches parent-PID spoofing today.
 - ETW and the driver carry no command line or parent image; command-line rules
   need Sysmon.
 - The sensor watchdog is observe-only and never restarts a dead sensor.

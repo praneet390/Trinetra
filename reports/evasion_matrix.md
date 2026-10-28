@@ -60,6 +60,15 @@ report.
 | 6 | Kernel-mode driver load (`DRIVER-LOAD` event) | none built | N/A | N/A | Y (code-traced only) | Y, kernel-exclusive | analytical only, not run |
 | 7 | Dual-sensor ancestry contradiction via PID-reuse timing | none built | — | — | — | — | not attempted, see incidental finding below |
 
+> **Erratum (2026-10-28).** Rows 1-2 record ETW as unable to see past a spoofed
+> parent. That reflects what `src/etw_monitor.py` extracts (the payload
+> `ProcessID` / `ParentProcessID`), **not a limit of ETW**: the event header's
+> process ID is the creating process, and Fibratus (`real_ppid`) and Velociraptor
+> (`Windows.ETW.KernelProcess`, same provider) both use it. The live results above
+> are accurate for the code as tested; the "structural" wording applies to rows 4-5
+> only (no `CommandLine` / `ParentImage` field exists in the ETW payload). See
+> [`docs/comparison.md`](../docs/comparison.md#5-correction-to-this-projects-own-matrix).
+
 ## Row-by-row
 
 **Row 1 - confirmed, clean.** `ppid_spoof_test.exe` run: claimed parent

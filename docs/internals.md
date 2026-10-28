@@ -1,6 +1,8 @@
 # Internals & reference
 
 > Long-form design notes, rationale and incident history. For the short version see the [README](../README.md).
+>
+> Note: where this text says ETW cannot see a process's real creator, see the correction in [comparison.md](comparison.md#5-correction-to-this-projects-own-matrix).
 
 
 A from-scratch EDR (Endpoint Detection & Response) agent for Windows. It fuses
