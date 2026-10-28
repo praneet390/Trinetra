@@ -130,12 +130,26 @@ To observe without any kill risk, comment out `self.mitigate(pid)` in
    cd tools\sysmon; .\Sysmon64.exe -accepteula -i config.xml
    ```
 
-3. **Build the kernel driver** *(optional; without it the agent runs on Sysmon and ETW)*
-   * Build `driver/sensor/sensor.vcxproj` (x64, Debug) with Visual Studio and the WDK. Output: `driver/sensor/x64/Debug/sensor.sys`.
-   * Sign it with a test certificate and trust that certificate in the VM.
-   * Run `bcdedit /set testsigning on` and reboot.
+3. **Install the kernel driver** *(optional; without it the agent runs on Sysmon and ETW)*
 
-   The agent creates and starts the `sensor` service itself.
+   Run the installer script **once** on each new machine (elevated PowerShell):
+   ```powershell
+   scripts\install_driver.ps1
+   ```
+   The script handles everything in one shot:
+   - Builds `sensor.sys` via MSBuild if it is not already built (requires VS 2022 + WDK)
+   - Creates a self-signed code-signing certificate and trusts it in the machine stores
+   - Signs `sensor.sys`
+   - Enables test-signing mode (`bcdedit /set testsigning on`)
+   - Creates and starts the `sensor` kernel-driver Windows service
+
+   If test signing was not already on, the script tells you to reboot once.
+   After that reboot (or if test signing was already on) the agent starts the
+   service itself on every subsequent launch via `ensure_driver_running()` in
+   `kernel_sensor.py` — no further manual steps.
+
+   > **Note:** test-signing mode is required for the self-signed certificate.
+   > Use a disposable or dedicated VM; do not enable it on a production machine.
 
 4. **Optional threat intel**: metadata only (imphash, family, tags) from [MalwareBazaar](https://bazaar.abuse.ch); sample binaries are never downloaded.
    ```powershell
