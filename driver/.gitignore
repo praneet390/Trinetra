@@ -3,8 +3,9 @@
 x64/
 Debug/
 Release/
-*.sys
-*.cer
+# These two are committed: pre-built signed binary + public cert for new machines.
+!sensor.sys
+!EntityDriverCert.cer
 *.pfx
 *.pdb
 *.obj
