@@ -1,9 +1,18 @@
-# Windows Defensive Agent (EDR Prototype)
+# Windows Defensive Agent (EDR)
 
-A small, from-scratch EDR (Endpoint Detection & Response) prototype for Windows,
-combining static PE analysis, real-time Sysmon-driven behavioral detection, and
-an active process/module sweep — plus a scored heuristic engine that can
+A from-scratch EDR (Endpoint Detection & Response) agent for Windows. It fuses
+**three independent process sensors** — Sysmon, raw ETW, and a custom
+**kernel-mode driver** — with static PE analysis and an active process/module
+sweep, and feeds everything into one scored heuristic engine that can
 auto-mitigate (suspend + terminate) a process that crosses a threat threshold.
+
+The central idea: every sensor has a *structural* blind spot (Sysmon and ETW
+only ever see a process's **claimed** parent; ETW and the driver carry no
+command line), so the sensors' **disagreement and complementary coverage are
+themselves detection signals**. [`reports/evasion_matrix.md`](reports/evasion_matrix.md)
+documents, with live-tested results, which techniques each sensor catches
+alone, which only the fusion catches — and the one case (a non-elevated
+`OpenProcess` on LSASS) that no sensor in the pipeline can see.
 
 Built and hardened through live-fire testing on a real Windows machine, not
 just unit tests — several of the design decisions below exist specifically
@@ -17,6 +26,7 @@ worse) when run against real system activity. Those are called out inline.
 - [How it works](#how-it-works)
 - [Architecture](#architecture)
 - [Kernel telemetry: ETW + Sysmon correlation](#kernel-telemetry-etw--sysmon-correlation)
+- [Kernel driver sensor](#kernel-driver-sensor)
 - [What each detector actually catches](#what-each-detector-actually-catches)
 - [Threat intel sync (MalwareBazaar)](#threat-intel-sync-malwarebazaar)
 - [Safety model](#safety-model-read-this-before-running-it)
@@ -35,8 +45,9 @@ worse) when run against real system activity. Those are called out inline.
 
 ## How it works
 
-The agent runs three independent detection surfaces in parallel, all feeding
-one shared scoring engine:
+The agent runs several independent detection surfaces in parallel — three
+behavioral sensors (Sysmon, ETW, kernel driver), a static scanner and an active
+module sweep — all feeding one shared scoring engine:
 
 1. **Static scan** (`src/static_scanner.py`) — reads pre-extracted PE
    features (`data/binaries.json`, produced offline by
@@ -47,9 +58,11 @@ one shared scoring engine:
    files with identical structure but different hashes — the same malware
    family repacked).
 
-2. **Behavioral telemetry — two independent kernel sensors** fused into one
+2. **Behavioral telemetry — three independent sensors** fused into one
    stream (`src/telemetry_monitor.py`, `src/etw_monitor.py`,
-   `src/process_correlator.py` + `src/heuristic_engine.py`): Sysmon's
+   `src/kernel_sensor.py` + `driver/sensor/sensor.c`,
+   `src/process_correlator.py` + `src/heuristic_engine.py`; the driver is
+   described in [Kernel driver sensor](#kernel-driver-sensor)): Sysmon's
    `Microsoft-Windows-Sysmon/Operational` event log (`EvtSubscribe`,
    push-based, rich fields) and raw ETW on
    `Microsoft-Windows-Kernel-Process` (`pywintrace`, thinner fields but
@@ -226,6 +239,59 @@ the same PID-reuse race window (bounded by `fuse_window`) that
 `heuristic_engine.py`'s `_reset_score_if_pid_reused` already documents
 elsewhere in this codebase as a known, accepted edge case.
 
+## Kernel driver sensor
+
+`driver/sensor/sensor.c` is a WDM kernel driver (device `\\.\malprojectsensor`)
+that gives the agent a third sensor whose answers a user-mode caller cannot
+influence. `src/kernel_sensor.py` starts the driver's service, opens its
+device, and polls one IOCTL (`GET_EVENT`) that drains a bounded 256-entry
+circular queue. Every event carries a sequence number, so a gap is counted as
+dropped events and surfaces through the same `SensorHealth` / blind-state
+machinery as Sysmon and ETW.
+
+| Event | Source in the driver | What it gives the engine |
+|---|---|---|
+| Process create | `PsSetCreateProcessNotifyRoutineEx` | The **real creator PID** (`CreatingThreadId`), compared with the claimed parent PID. A mismatch is kernel-verified parent-PID spoofing (`PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`), which Sysmon and ETW cannot see past. Also serves as the sensor's heartbeat. |
+| LSASS access | `ObRegisterCallbacks` on process handles | Handle requests to `lsass.exe` carrying the same dangerous-rights mask the Sysmon rule uses. **Observe-only.** |
+| Driver load | `PsSetLoadImageNotifyRoutine` (kernel-mode images only) | A new kernel driver appearing mid-session. |
+
+Thread-create and ordinary user-mode image-load notifications are registered
+too but stay `DbgPrintEx`-only; forwarding them would flood user mode.
+
+**Self-protection.** The agent calls `REGISTER_SELF`; the driver then strips
+`PROCESS_TERMINATE`, suspend/resume, create-thread, VM-operation and VM-write
+rights from any *other* process's handle to it, so `taskkill /F` and
+remote-thread injection against the agent fail. The PID is always the
+caller's own, never caller-supplied, and the slot is freed on process exit so
+a reused PID does not inherit immunity. This is not driver self-protection:
+an administrator can still `sc stop` the driver, and the protection goes with
+it.
+
+**Scoring** (`heuristic_engine.py`). A kernel-verified PPID spoof scores +80,
+or +20 when the *real creator* resolves under System32/SysWOW64: Windows' own
+packaged-app/COM brokers legitimately reparent children, and an unconditional
++80 killed a live Outlook three times in testing. LSASS access scores +70
+(+30 for a System32 caller); a driver load scores +20.
+
+**Honest limits** (documented in `sensor.c` and `reports/evasion_matrix.md`):
+
+- Windows' PPL enforcement rejects a lower-privilege caller's `OpenProcess`
+  on LSASS *before* any registered Ob callback runs, for any driver. So the
+  LSASS sensor only sees callers at a comparable protection level. Closing
+  that needs an ELAM-class signed driver, not a code change.
+- Like ETW, the driver carries no command line and no parent image path.
+- The driver is built for test-signing (see [Building the driver](#building-the-kernel-driver)),
+  not production attestation signing. The `ObRegisterCallbacks` altitude is a
+  placeholder that would need a properly assigned value in a shipping product.
+- A missing or untrusted driver is a normal "sensor unavailable" condition:
+  the agent logs it and continues on Sysmon and ETW.
+
+The `driver/sensor/*_test.c` programs are the attack harnesses behind the
+evasion matrix (PPID spoof via an untrusted and a trusted broker, LSASS
+access, command-line and parent-image blind spots, self-protection, and the
+comms channel). They use documented Win32 APIs only and take no destructive
+action.
+
 ### Self-test: proving the pipeline, not just the process
 
 `sensor_health.py`'s heartbeat/blind-state tracking proves a sensor's
@@ -243,7 +309,7 @@ loudly, per the architectural principle below); results are logged only on
 transition (pass↔fail), like the watchdog's staleness tracking, so a
 healthy pipeline doesn't spam the alert feed every cycle.
 
-Scoped honestly: this only tests what this prototype actually has a
+Scoped honestly: this only tests what this agent actually has a
 sensor for — process-create visibility and (dashboard-only) alert
 generation. It makes no claim about file, memory, network, or
 cloud-delivery visibility, because no sensor for those exists here yet.
@@ -336,7 +402,7 @@ real weaknesses are documented rather than encoded as expected behavior.
 None are open right now — the two it originally reported are fixed and
 checked (see above).
 
-**Scope.** It tests what this prototype actually has: process-create
+**Scope.** It tests what this agent actually has: process-create
 telemetry from two sensors, the correlator, health/blind-state, and the log
 pipeline. It makes no claim about file, memory, network, or cloud-delivery
 failures because no sensor for those exists here, and it does not stop real
@@ -650,6 +716,32 @@ Verify it's running:
 Get-Service Sysmon64
 ```
 
+### Building the kernel driver
+
+Optional: without it the agent runs on Sysmon and ETW and reports the kernel
+sensor as unavailable. Needs Visual Studio with the Windows Driver Kit (the
+project targets `WindowsKernelModeDriver10.0`, SDK 10.0.26100.0). **Do this in
+a disposable test VM** — it enables test-signing and loads an unattested
+kernel driver.
+
+1. Build `driver/sensor/sensor.vcxproj` for `x64` (Debug). The link step passes
+   `/integritycheck`; `PsSetCreateProcessNotifyRoutineEx` fails with
+   `STATUS_ACCESS_DENIED` without it. Output: `driver/sensor/x64/Debug/sensor.sys`,
+   the path `src/kernel_sensor.py` looks for.
+2. Sign `sensor.sys` with a self-made test certificate (the project sets
+   `SignMode=Off`; signing is a separate step), and trust that certificate in
+   the VM.
+3. Enable test-signing (`bcdedit /set testsigning on`) and reboot.
+
+`kernel_sensor.ensure_driver_running()` creates the `sensor` kernel-driver
+service on first run and starts it; the agent stops it on clean exit. Build
+output, `*.sys`, `*.pfx` and `*.cer` are git-ignored (`driver/.gitignore`).
+
+The test harnesses in `driver/sensor/*_test.c` build with
+`cl.exe /nologo /W4 /EHsc <name>.c /link /OUT:<name>.exe` from a VS developer
+prompt (`ppid_spoof_trusted_broker_test.c` is a DLL run through `rundll32.exe`;
+see [`reports/evasion_matrix.md`](reports/evasion_matrix.md)).
+
 ## Running it
 
 The behavioral monitor needs Administrator to subscribe to the Sysmon
@@ -668,13 +760,15 @@ You should see:
 [*] Starting Behavioral Telemetry Monitors...
 [+] Sysmon push subscription active. Awaiting real-time events...
 [+] ETW kernel-process capture active. Awaiting real-time events...
+[+] Kernel driver sensor active. Awaiting real-time events...
 [*] EDR Engine is active. Press Ctrl+C to terminate.
 ```
 
-Either sensor can fail to start independently without stopping the other -
-`[-] Sysmon telemetry monitor failed to start.` and/or `[-] ETW telemetry
-monitor failed to start.` — the static scan and module sweep still run
-fine on their own, and whichever behavioral sensor did start keeps working.
+Any sensor can fail to start independently without stopping the others -
+`[-] Sysmon telemetry monitor failed to start.`, `[-] ETW telemetry
+monitor failed to start.` and/or `[-] Kernel driver sensor failed to start.` —
+the static scan and module sweep still run fine on their own, and whichever
+behavioral sensors did start keep working.
 
 Press `Ctrl+C` to stop.
 
@@ -922,7 +1016,9 @@ mal_project/
 │   ├── static_scanner.py   Reads data/binaries.json, scores static PE findings
 │   ├── telemetry_monitor.py  Sysmon EvtSubscribe wiring
 │   ├── etw_monitor.py       Raw ETW Kernel-Process sensor (pywintrace) - independent of Sysmon
-│   ├── process_correlator.py Fuses matching ETW + Sysmon process-create events (provisional/fused)
+│   ├── kernel_sensor.py     Kernel driver sensor client - starts the service, polls the driver's IOCTL queue, routes events
+│   ├── hands_on.py          HANDS-ON THREAT (Cobalt Strike) classification shared by scanner and dashboard
+│   ├── process_correlator.py Fuses matching ETW + Sysmon process-create events (provisional/fused) and routes kernel events
 │   ├── sensor_health.py     Per-sensor heartbeat tracking + observe-only staleness watchdog + aggregate blind-state
 │   ├── self_test.py         Periodic benign self-test - proves the telemetry/alert pipeline actually delivers, not just that a thread is alive
 │   ├── failure_lab.py       Software-only failure-injection lab - breaks the telemetry pipeline on purpose and verifies detection/fallback/recovery
@@ -936,6 +1032,9 @@ mal_project/
 │   ├── conftest.py          Pytest bootstrap: stand-ins for Windows-only imports so the suite runs off-Windows too
 │   ├── webapp/              Dashboard frontend (HTML/CSS/JS, Chart.js via CDN)
 │   └── test_*.py            Self-checks (synthetic-XML rule tests, static-scan fixtures, mocked sweeps) - `python test_x.py`
+├── driver/
+│   ├── sensor/              Kernel driver (sensor.c, sensor.vcxproj) + attack/test harnesses (*_test.c)
+│   └── hello/               Minimal driver used to validate the toolchain and signing setup
 ├── tools/
 │   ├── extract_features.py Offline PE feature extractor (pefile-based, never executes samples)
 │   ├── threat_intel_sync.py MalwareBazaar metadata sync (imphash/family intel, never downloads samples)
@@ -952,9 +1051,9 @@ mal_project/
 │   ├── known_imphashes.json  Family/imphash intel (output of threat_intel_sync.py; absent until you run it)
 │   └── known_good_hashes.json  Hand-maintained SHA-256 allowlist (absent by default; see Known-good hash allowlist)
 ├── samples/                 Raw samples go here locally - not committed (see samples/README.md)
-├── reports/                 Manual malware analysis write-ups for specific samples
+├── reports/                 Malware analysis write-ups + evasion_matrix.md (live-tested sensor-fusion results)
 └── scripts/
-    └── monitor.ps1           Earlier PowerShell-only prototype of the telemetry monitor
+    └── monitor.ps1           Earlier PowerShell-only version of the telemetry monitor (superseded)
 ```
 
 ## Known limitations / roadmap
@@ -999,8 +1098,16 @@ mal_project/
 - **Benign commands on those hosts can still trigger the Defender-tamper rule and be mitigated**: it matches text, not intent. Confirmed still flagged: a read-only `Get-MpPreference | Select DisableRealtimeMonitoring`, *re-enabling* protection (`-DisableRealtimeMonitoring $false`), `Remove-MpPreference` (which tightens Defender), and a PowerShell/`cmd` command line that merely quotes a pattern (`Select-String 'set-mppreference' ...`, `echo sc stop windefend`). Fixing these needs a policy decision (an exclusion an attacker could game, or making interpreter-only matches non-lethal), so it is left as-is rather than guessed at.
 - **`mitigate()`'s "simulated memory snapshot" at score ≥ 50 does nothing
   yet** — it's a log line, not an actual forensic capture.
-- No persistence/config file yet — thresholds, decay rate, and the
-  protected-process list are all constants in `heuristic_engine.py`.
+- **The kernel driver is test-signed**, not attestation- or ELAM-signed, and
+  uses a placeholder `ObRegisterCallbacks` altitude. It cannot protect itself
+  from `sc stop`, and its LSASS handle sensor cannot see callers PPL rejects
+  (see [Kernel driver sensor](#kernel-driver-sensor)).
+- **Detection gaps by design of the sensors**: no sensor sees a non-elevated
+  `OpenProcess` on LSASS; ETW and the driver carry no command line or parent
+  image. `reports/evasion_matrix.md` lists the cells that were not run live
+  (e.g. fusion with Sysmon stopped).
+- Four `vm_eval.py` techniques (scheduled-task and service persistence,
+  shadow-copy deletion, certutil abuse) have no rule yet.
 
 ## Credits / inspiration
 

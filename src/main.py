@@ -29,7 +29,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format='[*] %(message)s', force=True)
 
     print("=====================================================")
-    print("      Windows Defensive Agent (EDR Prototype)        ")
+    print("          Windows Defensive Agent (EDR)              ")
     print("=====================================================")
 
     # 1. Initialize Heuristic Engine - the same additive YAML rule pack
