@@ -240,21 +240,6 @@ blind-spot matrix, and an OSI-licensed project that includes the driver. Rule
 breadth, ecosystem, scale and maturity favour the established tools; this project
 does not try to replace them.
 
-## Limitations
-
-* The driver is **test-signed**, not attestation- or ELAM-signed, and uses a placeholder `ObRegisterCallbacks` altitude. It cannot stop an admin's `sc stop`.
-* No sensor sees a non-elevated `OpenProcess` on LSASS.
-* The ETW path ignores the event header's creating PID, so only the driver catches parent-PID spoofing today.
-* ETW and the driver carry no command line or parent image; command-line rules need Sysmon.
-* The sensor watchdog is observe-only and never restarts a dead sensor.
-* Scoring is keyed on PID (with a start-time reuse guard), not `ProcessGuid`.
-* Defender-tamper and PowerShell rules match text, not intent, so some benign commands (e.g. a read-only `Get-MpPreference`) can still be flagged.
-* No rules yet for scheduled-task or service persistence, shadow-copy deletion or certutil abuse.
-* Sysmon EventID 7 has a Sigma rule but no engine handler; `module_inspector.py` covers that case.
-* The "memory snapshot" at score 50 is a log line, not a capture.
-
-More detail: [docs/internals.md](docs/internals.md).
-
 ## Project layout
 
 ```
