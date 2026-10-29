@@ -257,7 +257,3 @@ data/       binaries.json, known_imphashes.json
 reports/    malware write-ups, evasion_matrix.md
 docs/       internals.md (design notes), comparison.md (sourced comparison)
 ```
-
-## License
-
-[MIT](LICENSE)
