@@ -70,7 +70,16 @@ def _on_etw_event(event_tufo, event_queue, on_heartbeat=None, on_drop=None):
     tuple (not the raw event_dict) so the scoring worker doesn't need to
     know anything about pywintrace's decoding conventions. Mirrors
     telemetry_monitor.on_sysmon_event: do the minimum here, hand off the
-    rest, never block this callback on scoring."""
+    rest, never block this callback on scoring.
+
+    The queued tuple is (pid, parent_pid, image_name, create_time,
+    creator_pid). creator_pid is the process ID in the ETW event HEADER
+    (pywintrace exposes it as event["EventHeader"]["ProcessId"], a raw int
+    straight from the EVENT_HEADER struct - distinct from the payload's
+    "ProcessID", which is the NEW process). For a ProcessStart the header
+    pid is the process that generated the event, i.e. the creating process;
+    Fibratus (real_ppid) and Velociraptor (Windows.ETW.KernelProcess) both
+    rely on that. It is None when the header carries no ProcessId."""
     try:
         _event_id, event = event_tufo
         # pywintrace uppercases the manifest task name before handing it to
@@ -88,6 +97,7 @@ def _on_etw_event(event_tufo, event_queue, on_heartbeat=None, on_drop=None):
         parent_pid = event.get("ParentProcessID")
         image_name = event.get("ImageName")
         create_time = event.get("CreateTime")
+        creator_pid = event.get("EventHeader", {}).get("ProcessId")
     except Exception as e:
         logging.error(f"[ETW] Error extracting fields from a Kernel-Process event: {e}")
         return
@@ -99,7 +109,7 @@ def _on_etw_event(event_tufo, event_queue, on_heartbeat=None, on_drop=None):
         on_heartbeat()
 
     try:
-        event_queue.put_nowait((pid, parent_pid, image_name, create_time))
+        event_queue.put_nowait((pid, parent_pid, image_name, create_time, creator_pid))
     except queue.Full:
         logging.warning("[ETW] Event queue full - dropping an event because scoring is falling behind.")
         if on_drop:
@@ -107,15 +117,23 @@ def _on_etw_event(event_tufo, event_queue, on_heartbeat=None, on_drop=None):
 
 
 def _scoring_worker(engine_instance, event_queue, correlator=None):
-    """Drains (pid, parent_pid, image_name, create_time) tuples off the
-    queue and runs them through the heuristic engine (or the correlator, if
-    one is wired in - see start_etw_monitor), on a thread separate from the
-    ETW consumer callback above."""
+    """Drains (pid, parent_pid, image_name, create_time[, creator_pid])
+    tuples off the queue and runs them through the heuristic engine (or the
+    correlator, if one is wired in - see start_etw_monitor), on a thread
+    separate from the ETW consumer callback above. A 4-tuple (no creator
+    pid) is accepted too. creator_pid is passed to the correlator only when
+    known, so a correlator or wrapper written before it existed keeps
+    working unchanged; the no-correlator path never uses it (the creator
+    cross-checks live in the correlator)."""
     while True:
-        pid, parent_pid, image_name, create_time = event_queue.get()
+        pid, parent_pid, image_name, create_time, *rest = event_queue.get()
+        creator_pid = rest[0] if rest else None
         try:
             if correlator is not None:
-                correlator.submit_etw(pid, parent_pid, image_name, create_time)
+                if creator_pid is None:
+                    correlator.submit_etw(pid, parent_pid, image_name, create_time)
+                else:
+                    correlator.submit_etw(pid, parent_pid, image_name, create_time, creator_pid=creator_pid)
             else:
                 engine_instance.evaluate_etw_process_start(pid, parent_pid, image_name, create_time)
         except Exception as e:

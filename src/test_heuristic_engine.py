@@ -857,6 +857,140 @@ def test_kernel_ppid_spoof_not_flagged_when_driver_reports_no_mismatch():
     assert pid not in engine.process_scores
 
 
+# ---- ETW-header creator PPID spoofing (second witness, default OFF) --------
+# The ETW event header's creating pid (etw_monitor/process_correlator) versus
+# the payload's claimed parent. Scores through the same helper and the same
+# check id as the kernel branch above.
+
+def _etw_engine(enabled):
+    import copy
+    from detection_config import DEFAULTS
+    config = copy.deepcopy(DEFAULTS)
+    config['correlator']['etw_creator_scoring'] = enabled
+    return HeuristicEngine(config=config)
+
+
+def _etw_dispatch(engine, pid, claimed_parent, creator, creator_exe=r"C:\Users\bob\AppData\Local\Temp\dropper.exe",
+                  source='etw', dedup_key=None):
+    data = {
+        'ProcessId': pid, 'ParentProcessId': claimed_parent, 'Image': 'evil.exe',
+        'ParentImage': None, 'CommandLine': None, '_source': source,
+    }
+    if creator is not None:
+        data['_etw_creator_pid'] = creator
+    if dedup_key is not None:
+        data['_dedup_key'] = dedup_key
+    original = he.psutil.Process
+    he.psutil.Process = lambda p: _fake_resolvable_process(creator_exe)
+    try:
+        engine._handle_process_create(data)
+    finally:
+        he.psutil.Process = original
+
+
+def test_etw_creator_scoring_is_off_by_default():
+    from detection_config import DEFAULTS
+    assert DEFAULTS['correlator']['etw_creator_scoring'] is False
+    assert HeuristicEngine()._etw_creator_scoring_enabled() is False
+
+
+def test_etw_creator_mismatch_does_not_score_while_the_flag_is_off():
+    engine = _etw_engine(False)
+    pid = fresh_pid()
+    _etw_dispatch(engine, pid, claimed_parent=1, creator=fresh_pid())
+    assert pid not in engine.process_scores
+
+
+def test_etw_creator_mismatch_scores_untrusted_creator_at_full_severity_when_enabled():
+    engine = _etw_engine(True)
+    pid = fresh_pid()
+    _etw_dispatch(engine, pid, claimed_parent=1, creator=fresh_pid())
+    assert engine.process_scores[pid] == 0  # +80 crosses critical alone, reset after mitigation (as the kernel test)
+
+
+def test_etw_creator_mismatch_is_discounted_for_a_trusted_broker_creator():
+    engine = _etw_engine(True)
+    pid = fresh_pid()
+    _etw_dispatch(engine, pid, claimed_parent=1, creator=fresh_pid(), creator_exe=r"C:\Windows\System32\RuntimeBroker.exe")
+    assert engine.process_scores[pid] == 20
+
+
+def test_etw_creator_matching_the_claimed_parent_does_not_score():
+    engine = _etw_engine(True)
+    pid = fresh_pid()
+    _etw_dispatch(engine, pid, claimed_parent=1234, creator=1234)
+    assert pid not in engine.process_scores
+    # pywintrace hands the payload pid over as a string; the header pid is an int
+    _etw_dispatch(engine, pid, claimed_parent="1234", creator=1234)
+    assert pid not in engine.process_scores
+
+
+def test_etw_creator_unknown_or_unparseable_never_scores():
+    engine = _etw_engine(True)
+    for claimed, creator in ((1, None), (None, 5), ("garbage", 5), ("", 5)):
+        pid = fresh_pid()
+        _etw_dispatch(engine, pid, claimed_parent=claimed, creator=creator)
+        assert pid not in engine.process_scores, (claimed, creator)
+
+
+def test_etw_creator_is_ignored_on_non_etw_dispatches():
+    engine = _etw_engine(True)
+    for source in ('fused', 'sysmon'):
+        pid = fresh_pid()
+        _etw_dispatch(engine, pid, claimed_parent=1, creator=fresh_pid(), source=source)
+        assert pid not in engine.process_scores, source
+
+
+def test_kernel_and_etw_reports_of_one_spoof_score_once():
+    # Same real event seen by both witnesses shares a dedup key (the
+    # correlator sets it to the pid) and the same check id -> one score.
+    engine = _etw_engine(True)
+    pid = fresh_pid()
+    creator = fresh_pid()
+    original = he.psutil.Process
+    he.psutil.Process = lambda p: _fake_resolvable_process(r"C:\Windows\System32\RuntimeBroker.exe")
+    try:
+        engine._handle_process_create({
+            'ProcessId': pid, 'ParentProcessId': 1, 'Image': 'evil.exe', 'ParentImage': None, 'CommandLine': None,
+            '_source': 'etw', '_etw_creator_pid': creator, '_dedup_key': pid,
+        })
+        engine._handle_process_create({
+            'ProcessId': pid, 'ParentProcessId': 1, 'Image': 'evil.exe', 'ParentImage': None, 'CommandLine': None,
+            '_source': 'kernel', '_kernel_real_creator_pid': creator, '_kernel_ppid_spoof_detected': True,
+            '_dedup_key': pid,
+        })
+    finally:
+        he.psutil.Process = original
+    assert engine.process_scores[pid] == 20, "scored once (20), not once per sensor (40)"
+
+
+def test_spoof_finding_text_names_its_evidence_source():
+    engine = _etw_engine(True)
+    seen = []
+    engine._score_once = lambda key, check, pid, score, ctx: seen.append((check, score, ctx))
+    original = he.psutil.Process
+    he.psutil.Process = lambda p: _fake_resolvable_process(r"C:\Users\bob\AppData\Local\Temp\dropper.exe")
+    try:
+        engine._handle_process_create({
+            'ProcessId': 5, 'ParentProcessId': 1, 'Image': 'evil.exe', 'ParentImage': None, 'CommandLine': None,
+            '_source': 'kernel', '_kernel_real_creator_pid': 9, '_kernel_ppid_spoof_detected': True,
+        })
+        engine._handle_process_create({
+            'ProcessId': 6, 'ParentProcessId': 1, 'Image': 'evil.exe', 'ParentImage': None, 'CommandLine': None,
+            '_source': 'etw', '_etw_creator_pid': 9,
+        })
+    finally:
+        he.psutil.Process = original
+    (kernel_check, kernel_score, kernel_ctx), (etw_check, etw_score, etw_ctx) = seen
+    assert kernel_check == etw_check == 'kernel_ppid_spoof' and kernel_score == etw_score == 80
+    # the kernel wording is exactly what it was before the helper was shared
+    assert kernel_ctx == ("Kernel-verified PPID spoofing: process claims parent PID 1 but was actually created by "
+                          "PID 9 (PROC_THREAD_ATTRIBUTE_PARENT_PROCESS or equivalent) - unspoofable kernel ground "
+                          "truth, not a cross-sensor inference")
+    assert etw_ctx.startswith("ETW-header PPID spoofing: process claims parent PID 1 but was actually created by PID 9")
+    assert "kernel ground truth" not in etw_ctx
+
+
 # ---- _dispatch regression: evaluate_event behavior is unchanged -----------
 
 def test_dispatch_extraction_preserves_evaluate_event_behavior():

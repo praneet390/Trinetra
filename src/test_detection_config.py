@@ -57,6 +57,35 @@ def test_full_override():
         os.unlink(path)
 
 
+def test_correlator_witness_defaults_are_safe():
+    # Warning-only gap detection is on; the ETW-header creator only SCORES
+    # (and so can auto-terminate) once an operator turns it on.
+    correlator = DEFAULTS['correlator']
+    assert correlator['witness_check'] is True
+    assert correlator['witness_window_seconds'] == 5.0
+    assert correlator['etw_creator_scoring'] is False
+
+
+def test_shipped_config_file_matches_the_witness_defaults():
+    config = load_config()
+    assert config['correlator']['witness_check'] is True
+    assert config['correlator']['witness_window_seconds'] == 5.0
+    assert config['correlator']['etw_creator_scoring'] is False
+    assert config['correlator']['fuse_window_seconds'] == DEFAULTS['correlator']['fuse_window_seconds']
+
+
+def test_partial_correlator_override_keeps_the_other_witness_defaults():
+    with tempfile.NamedTemporaryFile('w', suffix='.yml', delete=False) as f:
+        f.write("correlator:\n  etw_creator_scoring: true\n")
+        path = f.name
+    try:
+        correlator = load_config(path)['correlator']
+        assert correlator['etw_creator_scoring'] is True
+        assert correlator['witness_check'] is True and correlator['witness_window_seconds'] == 5.0
+    finally:
+        os.unlink(path)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for t in tests:

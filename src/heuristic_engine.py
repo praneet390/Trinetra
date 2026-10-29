@@ -863,6 +863,50 @@ class HeuristicEngine:
         """The most recent access edge this PID originated, or None."""
         return self._recent_access_edges.get(pid)
 
+    def _etw_creator_scoring_enabled(self):
+        """config correlator.etw_creator_scoring (default False). The ETW
+        event header's creating pid is recorded and cross-checked against
+        the kernel driver either way (process_correlator's creator-agreement
+        counters, exposed on /api/summary); this flag only decides whether a
+        mismatch with the claimed parent SCORES. It ships off because a
+        spoof verdict can auto-terminate a process and the header's meaning
+        on the exact provider this agent consumes has not been confirmed
+        live: turn it on once the agreement counters show the header pid
+        matching the kernel driver's real creator."""
+        try:
+            return bool(self.config.get('correlator', {}).get('etw_creator_scoring', False))
+        except AttributeError:
+            return False
+
+    def _score_ppid_spoof(self, dedup_key, pid, claimed_parent, real_creator, via_etw_header):
+        """Score one parent-PID-spoofing finding: `pid` claims parent
+        `claimed_parent` but `real_creator` actually created it. The real
+        creator comes from either the kernel driver or the ETW event header
+        (`via_etw_header`). Check id stays 'kernel_ppid_spoof' for both on
+        purpose - it is the dedup key that makes two sensors reporting the
+        same real event score once."""
+        try:
+            creator_image = psutil.Process(int(real_creator)).exe().lower()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, TypeError, ValueError):
+            creator_image = ''  # can't verify -> fails closed (untrusted/full score)
+        is_trusted_creator = _is_trusted_system_path(creator_image)
+        score = 20 if is_trusted_creator else 80
+        if via_etw_header:
+            label = 'Trusted-broker' if is_trusted_creator else 'ETW-header'
+            evidence = ("the ETW event header names the creating process - corroborating evidence, "
+                        "independent of the kernel driver")
+        else:
+            label = 'Trusted-broker' if is_trusted_creator else 'Kernel-verified'
+            evidence = "unspoofable kernel ground truth, not a cross-sensor inference"
+        context = (
+            f"{label} PPID spoofing: process "
+            f"claims parent PID {claimed_parent} but was actually created by PID {real_creator} "
+            f"(PROC_THREAD_ATTRIBUTE_PARENT_PROCESS or equivalent) - {evidence}"
+            + (" (real creator resolves to a trusted System32/SysWOW64 broker - likely benign "
+               "packaged-app/COM activation reparenting, not an attack)" if is_trusted_creator else "")
+        )
+        self._score_once(dedup_key, 'kernel_ppid_spoof', pid, score, context)
+
     def _handle_process_create(self, data):
         # Event ID 1: Flag execution from staging directories
         pid = int(data.get('ProcessId', 0))
@@ -903,23 +947,25 @@ class HeuristicEngine:
         # actual spoofing attack's real creator (the malware/dropper itself)
         # will essentially never resolve to System32/SysWOW64.
         if data.get('_source') == 'kernel' and data.get('_kernel_ppid_spoof_detected'):
-            real_creator = data.get('_kernel_real_creator_pid')
+            self._score_ppid_spoof(dedup_key, pid, data.get('ParentProcessId'),
+                                   data.get('_kernel_real_creator_pid'), via_etw_header=False)
+        elif data.get('_source') == 'etw' and self._etw_creator_scoring_enabled():
+            # Second, independent witness to the same technique: the ETW
+            # event header's creating pid (see etw_monitor._on_etw_event)
+            # versus the payload's claimed parent. Off by default - see
+            # _etw_creator_scoring_enabled. Present only on the provisional
+            # ETW dispatch (the fused/Sysmon dispatches carry no
+            # `_etw_creator_pid`), and routed through the SAME check id as
+            # the kernel branch, so when the driver is also running a single
+            # real spoof is scored once, not once per sensor.
+            etw_creator = data.get('_etw_creator_pid')
             claimed_parent = data.get('ParentProcessId')
             try:
-                creator_image = psutil.Process(int(real_creator)).exe().lower()
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, TypeError, ValueError):
-                creator_image = ''  # can't verify -> fails closed (untrusted/full score)
-            is_trusted_creator = _is_trusted_system_path(creator_image)
-            score = 20 if is_trusted_creator else 80
-            context = (
-                f"{'Trusted-broker' if is_trusted_creator else 'Kernel-verified'} PPID spoofing: process "
-                f"claims parent PID {claimed_parent} but was actually created by PID {real_creator} "
-                f"(PROC_THREAD_ATTRIBUTE_PARENT_PROCESS or equivalent) - unspoofable kernel ground truth, "
-                f"not a cross-sensor inference"
-                + (" (real creator resolves to a trusted System32/SysWOW64 broker - likely benign "
-                   "packaged-app/COM activation reparenting, not an attack)" if is_trusted_creator else "")
-            )
-            self._score_once(dedup_key, 'kernel_ppid_spoof', pid, score, context)
+                spoofed = etw_creator is not None and int(claimed_parent) != int(etw_creator)
+            except (TypeError, ValueError):
+                spoofed = False  # no usable claimed parent -> nothing to compare, never guess
+            if spoofed:
+                self._score_ppid_spoof(dedup_key, pid, claimed_parent, etw_creator, via_etw_header=True)
 
         if 'temp' in image or 'users\\public' in image:
             self._score_once(dedup_key, 'staging_dir', pid, 30, f"Execution from staging directory: {image}")

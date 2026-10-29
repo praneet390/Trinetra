@@ -88,7 +88,9 @@ POLL_ERROR_BACKOFF_SECONDS = 1.0
 # Relative to this file's own directory (src/), matching the
 # driver/sensor/ layout actually in this repo.
 _DRIVER_SYS_CANDIDATES = (
+    os.path.join(os.path.dirname(__file__), '..', 'driver', 'sensor', 'sensor.sys'),
     os.path.join(os.path.dirname(__file__), '..', 'driver', 'sensor', 'x64', 'Debug', 'sensor.sys'),
+    os.path.join(os.path.dirname(__file__), '..', 'driver', 'sensor', 'x64', 'Release', 'sensor.sys'),
 )
 
 

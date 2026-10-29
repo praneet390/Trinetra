@@ -33,10 +33,15 @@ def _wait_until(predicate, timeout=2.0, interval=0.01):
     return False
 
 
-def _process_start_event(pid=1234, parent_pid=1, image_name="evil.exe", create_time=100.0, task_name="PROCESSSTART"):
+def _process_start_event(pid=1234, parent_pid=1, image_name="evil.exe", create_time=100.0, task_name="PROCESSSTART",
+                         creator_pid=None):
+    header = {"EventDescriptor": {"Task": em.TASK_PROCESS_START}}
+    if creator_pid is not None:
+        # pywintrace: event["EventHeader"]["ProcessId"] is the header's raw int pid
+        header["ProcessId"] = creator_pid
     return (1, {
         "Task Name": task_name,
-        "EventHeader": {"EventDescriptor": {"Task": em.TASK_PROCESS_START}},
+        "EventHeader": header,
         "ProcessID": pid,
         "ParentProcessID": parent_pid,
         "ImageName": image_name,
@@ -62,7 +67,7 @@ def test_pywintrace_internal_warnings_are_silenced():
 def test_process_start_event_is_enqueued():
     q = queue.Queue()
     em._on_etw_event(_process_start_event(), q)
-    assert q.get_nowait() == (1234, 1, "evil.exe", 100.0)
+    assert q.get_nowait() == (1234, 1, "evil.exe", 100.0, None)
 
 
 def test_task_name_matches_regardless_of_spacing():
@@ -71,13 +76,37 @@ def test_task_name_matches_regardless_of_spacing():
     # work whether it comes through as "PROCESSSTART" or "PROCESS START".
     q = queue.Queue()
     em._on_etw_event(_process_start_event(task_name="Process Start"), q)
-    assert q.get_nowait() == (1234, 1, "evil.exe", 100.0)
+    assert q.get_nowait() == (1234, 1, "evil.exe", 100.0, None)
 
 
 def test_falls_back_to_numeric_task_id_when_name_is_unrecognized():
     q = queue.Queue()
     em._on_etw_event(_process_start_event(task_name="SOMETHING-ELSE"), q)
-    assert q.get_nowait() == (1234, 1, "evil.exe", 100.0)
+    assert q.get_nowait() == (1234, 1, "evil.exe", 100.0, None)
+
+
+def test_header_creator_pid_is_extracted_into_the_queued_tuple():
+    # The creating process is the EVENT HEADER's pid, not the payload's
+    # ProcessID (the new process) or ParentProcessID (only the claim).
+    q = queue.Queue()
+    em._on_etw_event(_process_start_event(pid=1234, parent_pid=1, creator_pid=777), q)
+    assert q.get_nowait() == (1234, 1, "evil.exe", 100.0, 777)
+
+
+def test_creator_pid_is_none_when_the_header_carries_no_process_id():
+    q = queue.Queue()
+    em._on_etw_event(_process_start_event(), q)
+    assert q.get_nowait()[4] is None
+
+
+def test_creator_pid_does_not_change_which_events_are_queued_or_counted_alive():
+    q = queue.Queue()
+    beats = []
+    ignored = (2, {"Task Name": "PROCESSSTOP", "EventHeader": {"EventDescriptor": {"Task": 2}, "ProcessId": 5}})
+    em._on_etw_event(ignored, q, on_heartbeat=lambda: beats.append(1))
+    assert q.empty() and beats == []
+    em._on_etw_event(_process_start_event(creator_pid=777), q, on_heartbeat=lambda: beats.append(1))
+    assert q.qsize() == 1 and beats == [1]
 
 
 def test_non_process_start_events_are_ignored():
@@ -167,6 +196,114 @@ def test_scoring_worker_drains_queue_on_its_own_thread():
     q.put((1234, 1, "evil.exe", 100.0))
     threading.Thread(target=em._scoring_worker, args=(engine, q), daemon=True).start()
     assert _wait_until(lambda: engine.calls == [(1234, 1, "evil.exe", 100.0)])
+
+
+class _FakeCorrelator:
+    def __init__(self):
+        self.calls = []
+
+    def submit_etw(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+
+
+def test_worker_passes_creator_pid_to_the_correlator_only_when_known():
+    # Without a creator the call must be EXACTLY the pre-existing 4-argument
+    # one, so any correlator/wrapper written before creator_pid existed
+    # (failure_lab's stallable consumer, older fakes) keeps working.
+    correlator = _FakeCorrelator()
+    q = queue.Queue()
+    q.put((1234, 1, "evil.exe", 100.0, None))
+    q.put((1235, 1, "evil2.exe", 101.0, 777))
+    threading.Thread(target=em._scoring_worker, args=(_FakeEngine(), q, correlator), daemon=True).start()
+    assert _wait_until(lambda: len(correlator.calls) == 2)
+    assert correlator.calls[0] == ((1234, 1, "evil.exe", 100.0), {})
+    assert correlator.calls[1] == ((1235, 1, "evil2.exe", 101.0), {"creator_pid": 777})
+
+
+def test_worker_accepts_a_legacy_four_tuple():
+    correlator = _FakeCorrelator()
+    q = queue.Queue()
+    q.put((1234, 1, "evil.exe", 100.0))
+    threading.Thread(target=em._scoring_worker, args=(_FakeEngine(), q, correlator), daemon=True).start()
+    assert _wait_until(lambda: correlator.calls == [((1234, 1, "evil.exe", 100.0), {})])
+
+
+class _DispatchOnlyEngine:
+    """Just enough engine for the real ProcessCorrelator (it only calls _dispatch)."""
+    def __init__(self):
+        self.dispatches = []
+
+    def _dispatch(self, event_id, data):
+        self.dispatches.append((event_id, dict(data)))
+
+
+def _kernel_create_event(pid, claimed_parent, real_creator, image=r"\Device\HarddiskVolume3\evil.exe"):
+    return {
+        "sequence_number": 1, "event_type": 1, "ppid_spoof_detected": claimed_parent != real_creator,
+        "pid": pid, "field2": claimed_parent, "field3": real_creator, "field4": 0,
+        "image_name_truncated": False, "image_name": image,
+    }
+
+
+def _end_to_end(etw_events, kernel_events, gate=lambda name: True):
+    """Real chain, no stand-ins for the pieces under test: pywintrace-shaped
+    event -> _on_etw_event -> bounded queue -> _scoring_worker thread ->
+    ProcessCorrelator, plus kernel_sensor._dispatch_event for the driver side."""
+    import kernel_sensor as ks
+    import process_correlator as pc
+
+    engine = _DispatchOnlyEngine()
+    correlator = pc.ProcessCorrelator(engine, witness_window=0.05)
+    correlator.enable_witness_check(gate, startup_grace=0.0)
+    time.sleep(0.01)
+    q = queue.Queue()
+    threading.Thread(target=em._scoring_worker, args=(engine, q, correlator), daemon=True).start()
+    for ev in etw_events:
+        em._on_etw_event(ev, q)
+    assert _wait_until(lambda: q.empty() and len(engine.dispatches) >= len(etw_events))
+    for ev in kernel_events:
+        ks._dispatch_event(ev, correlator, engine)
+    time.sleep(0.08)
+    logs = []
+    saved = (pc.logging.warning, pc.logging.info)
+    pc.logging.warning = lambda msg, *a, **k: logs.append(msg)
+    pc.logging.info = lambda msg, *a, **k: logs.append(msg)
+    try:
+        correlator._gc_once()
+    finally:
+        pc.logging.warning, pc.logging.info = saved
+    return correlator, engine, logs
+
+
+def test_end_to_end_etw_header_creator_agrees_with_the_kernel_real_creator():
+    correlator, engine, logs = _end_to_end(
+        [_process_start_event(pid=1234, parent_pid=999, creator_pid=777)],
+        [_kernel_create_event(1234, claimed_parent=999, real_creator=777)],
+    )
+    assert correlator.witness_stats()['creator_agreement'] == {'agree': 1, 'disagree': 0}
+    assert correlator.witness_stats()['gaps'] == {'etw': 0, 'kernel': 0} and logs == []
+    etw_dispatch = next(d for _, d in engine.dispatches if d['_source'] == 'etw')
+    assert etw_dispatch['_etw_creator_pid'] == 777 and etw_dispatch['ParentProcessId'] == 999
+
+
+def test_end_to_end_a_creation_only_the_kernel_saw_is_flagged_as_an_etw_gap():
+    correlator, _engine, logs = _end_to_end([], [_kernel_create_event(4321, claimed_parent=1, real_creator=1)])
+    assert correlator.witness_stats()['gaps'] == {'etw': 1, 'kernel': 0}
+    assert len(logs) == 1 and "[SENSOR-BLINDSPOT] ETW did not report" in logs[0] and "PID 4321" in logs[0]
+
+
+def test_end_to_end_a_creation_only_etw_saw_is_flagged_as_a_kernel_gap():
+    correlator, _engine, logs = _end_to_end([_process_start_event(pid=555, creator_pid=1)], [])
+    assert correlator.witness_stats()['gaps'] == {'etw': 0, 'kernel': 1}
+    assert len(logs) == 1 and "kernel driver did not report" in logs[0]
+
+
+def test_end_to_end_a_disagreeing_creator_is_counted_not_hidden():
+    correlator, _engine, _logs = _end_to_end(
+        [_process_start_event(pid=1234, parent_pid=999, creator_pid=111)],
+        [_kernel_create_event(1234, claimed_parent=999, real_creator=777)],
+    )
+    assert correlator.witness_stats()['creator_agreement'] == {'agree': 0, 'disagree': 1}
 
 
 def test_slow_scoring_does_not_block_the_callback_thread():

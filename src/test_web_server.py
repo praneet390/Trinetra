@@ -657,6 +657,49 @@ class _MonkeyPatch:
             setattr(obj, name, old)
 
 
+def test_backend_summary_exposes_the_witness_stats():
+    backend = ws.Backend()
+    witness = backend.summary()["witness"]
+    assert witness == {
+        'enabled': False,  # armed in start(), which this test never calls
+        'window_seconds': 5.0,
+        'gaps': {'etw': 0, 'kernel': 0},
+        'active_gaps': [],
+        'creator_agreement': {'agree': 0, 'disagree': 0},
+    }
+
+
+def test_backend_witness_gate_trusts_only_live_or_stale_sensors():
+    backend = ws.Backend()
+    # never started: handles are None -> 'unavailable' -> silence is explained
+    assert backend._witness_gate("etw") is False and backend._witness_gate("kernel") is False
+
+    backend._etw_handle = object()
+    backend._kernel_handle = object()
+    assert backend._witness_gate("etw") is True, "up but never heartbeated ('stale'): silence is unexplained"
+    backend.etw_health.touch()
+    assert backend._witness_gate("etw") is True, "'live'"
+    backend.etw_health.record_drop()
+    assert backend._witness_gate("etw") is False, "'lossy': already known to be dropping events"
+    assert backend._witness_gate("kernel") is True, "each sensor is judged on its own health"
+
+
+def test_backend_surfaces_a_sensor_blindspot_as_a_categorized_alert():
+    # Real pipeline, no mocks of the hops: correlator -> logging -> AlertStore -> categorize.
+    backend = ws.Backend()
+    backend._etw_handle = object()
+    backend.etw_health.touch()
+    backend.correlator.enable_witness_check(backend._witness_gate, startup_grace=0.0)
+    time.sleep(0.01)
+    backend.correlator.witness_window = 0.01
+    backend.correlator.submit_kernel(4243, 1, 1, "evil.exe", False)
+    time.sleep(0.03)
+    backend.correlator._gc_once()
+    alerts = [a for a in backend.alert_store.snapshot() if a["category"] == "Sensor Visibility"]
+    assert len(alerts) == 1 and "PID 4243" in alerts[0]["message"] and alerts[0]["severity"] == "WARNING"
+    assert backend.summary()["witness"]["gaps"]["etw"] == 1
+
+
 if __name__ == "__main__":
     import inspect
 

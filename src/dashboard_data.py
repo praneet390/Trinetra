@@ -21,6 +21,7 @@ WARNING_THRESHOLD = 50
 # so more specific labels (Ransomware) are listed before ones their
 # messages could also collide with (Execution).
 CATEGORY_RULES = (
+    ("Sensor Visibility", ("sensor-blindspot",)),
     ("Telemetry Contradiction", ("telemetry_contradiction",)),
     ("Ransomware", ("ransomware", "mass encryption")),
     ("Credential Access", ("lsass", "credential")),

@@ -192,12 +192,12 @@ class _StallableConsumer:
         with self._lock:
             return self.entered == self.processed
 
-    def submit_etw(self, pid, parent_pid, image_name, create_time):
+    def submit_etw(self, pid, parent_pid, image_name, create_time, **kwargs):
         with self._lock:
             self.entered += 1
         self._go.wait()
         try:
-            self._correlator.submit_etw(pid, parent_pid, image_name, create_time)
+            self._correlator.submit_etw(pid, parent_pid, image_name, create_time, **kwargs)
         finally:
             with self._lock:
                 self.processed += 1

@@ -34,6 +34,17 @@ DEFAULTS = {
         # alone - provisional default, not yet measured against real
         # Sysmon-vs-ETW delivery lag on a live system (see README).
         'fuse_window_seconds': 2.0,
+        # Per-event witness-gap check (process_correlator.py): a process
+        # creation reported by the kernel driver but not by ETW (or vice
+        # versa) within this many seconds is logged as [SENSOR-BLINDSPOT].
+        # Warning-only - it never scores or mitigates anything.
+        'witness_check': True,
+        'witness_window_seconds': 5.0,
+        # Whether a mismatch between the ETW event header's creating pid
+        # and the claimed parent SCORES as PPID spoofing. Off until the
+        # creator-agreement counters (/api/summary -> witness) confirm the
+        # header pid matches the kernel driver's real creator on your host.
+        'etw_creator_scoring': False,
     },
     'self_test': {
         # How often self_test.py's benign process-visibility/alert-pipeline
