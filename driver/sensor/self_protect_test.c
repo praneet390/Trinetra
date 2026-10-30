@@ -3,24 +3,10 @@
  *
  * Proves the exact scenario the feature exists for: "anyone with admin on
  * Windows should not be able to switch off the EDR tool with taskkill or
- * anything like it." This process:
- *
- *   1. Opens \\.\malprojectsensor and registers ITSELF as protected
- *      (IOCTL_MALPROJECT_REGISTER_SELF - the driver uses this call's own
- *      PID, not anything we send it).
- *   2. Spawns a background thread that polls IOCTL_MALPROJECT_GET_EVENT
- *      continuously and prints whatever arrives - proves the comms
- *      channel is live at the same time, not a separate test.
- *   3. Prints its own PID and sits idle for a window. During this window,
- *      from a SEPARATE shell, run:
- *          taskkill /F /PID <the printed pid>
- *      Expected: taskkill reports it could not terminate the process
- *      (access denied), and this process is still running afterward -
- *      confirm with Get-Process.
- *   4. Unregisters itself (IOCTL_MALPROJECT_UNREGISTER_SELF) and sits
- *      idle for a second window. Run the same taskkill command again.
- *      Expected: it succeeds this time - proving the protection is tied
- *      to registration state, not some blanket, unconditional behavior.
+ * anything like it." Registers itself, sits in a window for taskkill to
+ * run against (expected: access denied), then unregisters and reopens
+ * the window (expected: taskkill succeeds - protection is registration-
+ * state-tied, not a blanket unconditional block).
  *
  * Build (from a VS Developer environment, x64):
  *   cl.exe /nologo /W4 /EHsc self_protect_test.c /link /OUT:self_protect_test.exe

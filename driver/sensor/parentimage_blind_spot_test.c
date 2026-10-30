@@ -1,55 +1,12 @@
 /*
- * ParentImage blind-spot test harness - proves that heuristic_engine.
- * py's office_lolbin check (Office app spawning a LOLBin - the classic
- * macro-dropper chain) is structurally unreachable on the ETW or kernel
- * driver sensor paths, for the same root-cause reason as
- * cmdline_blind_spot_test.c but hitting a different field:
- *
- *     parent_image = (data.get('ParentImage') or '').lower()
- *     ...
- *     parent_name = os.path.basename(parent_image)
- *     if parent_name in OFFICE_PARENTS and child_name in LOLBIN_CHILDREN: ...
- *
- * ETW's raw ProcessStart event carries a parent PID but, confirmed via
- * Get-WinEvent, no parent IMAGE PATH - evaluate_etw_process_start sets
- * ParentImage=None. The kernel driver's PROC-CREATE event has nowhere
- * to get a parent image path from either - process_correlator.
- * submit_kernel sets ParentImage=None too. basename(None/'') is always
- * '', which is never in OFFICE_PARENTS, so office_lolbin can never fire
- * on an ETW-only or kernel-only dispatch - regardless of what the real
- * parent process actually is. This is a different structural gap than
- * the CommandLine one (a different field, feeding a different rule
- * family keyed on image basenames rather than command-line substrings),
- * included separately to show the "Sysmon-only field" problem is
- * general, not a one-rule quirk.
- *
- * This harness does NOT launch a real Office application (not
- * guaranteed to be installed, and unnecessary - office_lolbin matches
- * purely on the parent's resolved image basename, nothing else, no
- * signature/hash check). Instead it makes a throwaway COPY of the
- * harmless, already-present cmd.exe, renames that copy to "outlook.exe"
- * inside a scratch temp folder (never touches any system directory),
- * and launches a REAL child from that renamed copy - no PPID spoofing
- * trick is used or needed here, since this is testing a resolved-
- * image-path field, not process ancestry. The copy is deleted when the
- * test finishes.
- *
- * What it does:
- *   1. Copies C:\Windows\System32\cmd.exe to
- *      %TEMP%\entity2_evasion_matrix\outlook.exe.
- *   2. Launches that copy with "/c cmd.exe /c echo ... & timeout ..." -
- *      since the copy IS cmd.exe, it correctly interprets /c and spawns
- *      a REAL, non-spoofed LOLBin child (cmd.exe) of its own.
- *   3. Prints every PID/path involved.
- *   4. Terminates both processes and deletes the temp copy.
- *
- * How to use this for the evasion matrix: run it with Sysmon, ETW, and
- * the kernel driver all live simultaneously (no sensor needs to be
- * stopped for this one - the gap is structural per-sensor, not
- * configuration-dependent). Expect an office_lolbin finding (score 60)
- * attributed to the Sysmon-sourced or fused dispatch, and confirm via
- * logs that no ETW-only or kernel-only dispatch for the same pid ever
- * produced one.
+ * ParentImage blind-spot test harness - proves heuristic_engine.py's
+ * office_lolbin check is structurally unreachable on ETW or kernel sensor
+ * paths. ETW's ProcessStart carries no parent image path (confirmed via
+ * Get-WinEvent); process_correlator.submit_kernel sets ParentImage=None
+ * too. basename(None/'') is never in OFFICE_PARENTS, so office_lolbin
+ * cannot fire on ETW-only or kernel-only dispatch regardless of actual
+ * parent process. Run with all three sensors live to see the finding on
+ * the Sysmon/fused dispatch only.
  *
  * Build (from a VS Developer environment, x64):
  *   cl.exe /nologo /W4 /EHsc parentimage_blind_spot_test.c /link /OUT:parentimage_blind_spot_test.exe

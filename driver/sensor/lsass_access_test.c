@@ -1,18 +1,11 @@
 /*
  * LSASS handle-access test harness for driver/sensor/sensor.c's
- * ObRegisterCallbacks sensor (increment 2).
+ * ObRegisterCallbacks sensor.
  *
- * Finds lsass.exe's PID via a process snapshot, then calls
- * OpenProcess(PROCESS_VM_READ, FALSE, pid) - the exact access right
- * LSASS_DANGEROUS_BITS flags, and the real credential-dumping primitive
- * (MiniDumpWriteDump/Mimikatz-style). This is EXPECTED to fail with
- * ERROR_ACCESS_DENIED from an unprivileged, non-elevated caller against a
- * Protected-Process-Light target like LSASS on modern Windows - that is
- * fine and expected. The point of this test is NOT to actually read LSASS
- * memory (it won't, and doesn't need admin/SYSTEM to prove the point);
- * it is to prove the KERNEL SENSOR observes the ATTEMPT, since
- * ObRegisterCallbacks' pre-operation callback runs before the OS's own
- * access check, including PPL enforcement.
+ * OpenProcess will fail with ERROR_ACCESS_DENIED (PPL on modern Windows
+ * blocks it). The point is to prove the KERNEL SENSOR observes the
+ * ATTEMPT: ObRegisterCallbacks' pre-operation callback fires before the
+ * OS access check, including PPL enforcement.
  *
  * Build (from a VS Developer environment, x64):
  *   cl.exe /nologo /W4 /EHsc lsass_access_test.c /link /OUT:lsass_access_test.exe

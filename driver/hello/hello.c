@@ -1,16 +1,10 @@
 /*
- * Phase 1 "hello world" driver: proves the whole toolchain (build -> sign ->
- * deploy -> load -> observe in the live kernel debugger -> unload) with the
- * smallest possible amount of code. No device, no callbacks, no IOCTLs -
- * loaded as a bare legacy kernel-driver service (`sc create` / `sc start`,
- * no INF/PnP involved). Once this round-trips cleanly, Phase 2 replaces this
- * file with the real sensor driver (process/handle/registry callbacks) on
- * top of a toolchain already proven to work.
+ * Proof-of-toolchain "hello world" driver (no device, callbacks, or IOCTLs).
  *
- * DbgPrintEx at DPFLTR_ERROR_LEVEL is used deliberately instead of plain
- * DbgPrint: error-level messages always reach an attached kernel debugger
- * regardless of the Kd_*_Mask filter settings, so there is nothing extra to
- * configure in WinDbg to see this driver's output.
+ * DbgPrintEx at DPFLTR_ERROR_LEVEL is used deliberately: error-level
+ * messages always reach an attached kernel debugger regardless of the
+ * Kd_*_Mask filter settings, so there is nothing extra to configure in
+ * WinDbg to see this driver's output.
  */
 #include <ntddk.h>
 

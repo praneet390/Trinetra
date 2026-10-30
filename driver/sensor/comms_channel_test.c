@@ -1,9 +1,5 @@
 /*
- * Comms-channel test harness for driver/sensor/sensor.c's device/IOCTL
- * interface. Opens \\.\malprojectsensor and polls IOCTL_MALPROJECT_GET_EVENT
- * for a few seconds, printing whatever events arrive - proves the device
- * object, symbolic link, IRP_MJ_CREATE/CLOSE, and IOCTL dispatch all work
- * end-to-end before any Python-side wiring is built on top of them.
+ * Comms-channel end-to-end test for driver/sensor/sensor.c's IOCTL interface.
  *
  * The struct/IOCTL definitions below are a deliberate, exact copy of the
  * ones in sensor.c - there is no shared header yet (the real Python

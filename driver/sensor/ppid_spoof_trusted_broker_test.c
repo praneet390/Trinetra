@@ -2,51 +2,15 @@
  * Trusted-broker PPID-spoofing test harness for driver/sensor/sensor.c +
  * heuristic_engine.py's kernel_ppid_spoof check.
  *
- * ppid_spoof_test.c already proves the kernel sensor catches a spoofed
- * PPID when the REAL creator is an untrusted, arbitrary process (scored
- * 80). heuristic_engine._handle_process_create has a second branch for
- * this same check that this harness exists to exercise instead:
+ * ppid_spoof_test.c exercises the score=80 path. This harness exercises
+ * the score=20 path: when the REAL CREATOR (resolved from CreatingThreadId,
+ * not the claimed/spoofed parent) resolves to a System32/SysWOW64 path.
+ * This is the code path the dc5f6e4 Outlook fix tunes (a legitimate
+ * System32 broker doing COM/packaged-app reparenting must not score 80).
  *
- *     is_trusted_creator = _is_trusted_system_path(creator_image)
- *     score = 20 if is_trusted_creator else 80
- *
- * Read literally: the discount applies when the REAL CREATOR (the
- * process that actually called CreateProcess - resolved from the
- * driver's CreatingThreadId, i.e. field3/real_creator_pid, NOT the
- * claimed/spoofed parent) resolves to a path under System32/SysWOW64.
- * That is NOT the same thing as "the claimed parent looks trusted" -
- * it is "whoever actually made the CreateProcess call looks trusted."
- * This is also the exact code path the dc5f6e4 Outlook fix exists to
- * tune (a live, legitimate System32 broker doing normal COM/packaged-
- * app reparenting must not auto-kill a real mail client).
- *
- * A normal user-mode EXE launched from a regular path can't make the
- * "real creator" field read as System32 just by choosing where its own
- * .exe file sits - the driver resolves the ACTUAL calling process's own
- * image path, not anything this harness claims about itself. So this
- * harness is built as a DLL and must be loaded into an already-signed,
- * already-System32-resident host process via rundll32.exe - the
- * textbook LOLBin pattern (COMMAND_LINE_HOSTS already enumerates
- * rundll32.exe as a LOLBIN_CHILD elsewhere in this project) - so that
- * when THIS CODE calls CreateProcessA, the real creator the kernel
- * observes is genuinely rundll32.exe running from
- * C:\Windows\System32\rundll32.exe. Nothing is injected into another
- * already-running process; rundll32 loading an attacker/test-authored
- * DLL via its own documented command-line usage is rundll32 operating
- * exactly as designed.
- *
- * What it does, once loaded:
- *   1. Launches a throwaway "claimed parent" (idle cmd.exe) exactly like
- *      ppid_spoof_test.c.
- *   2. Spawns a real child claiming that throwaway as its parent via
- *      PROC_THREAD_ATTRIBUTE_PARENT_PROCESS - but the REAL creator this
- *      time is rundll32.exe (this DLL's own host process), not an
- *      arbitrary unsigned test binary.
- *   3. Prints every PID via an allocated console (rundll32 attaches no
- *      console by default) so the operator can cross-check the kernel
- *      sensor's PROC-CREATE line and heuristic_engine's resulting score
- *      (expected: 20, "Trusted-broker PPID spoofing", not 80).
- *   4. Cleans up both spawned processes afterward.
+ * Built as a DLL loaded via rundll32.exe so the kernel observes the real
+ * creator as C:\Windows\System32\rundll32.exe - a normal user-mode EXE
+ * cannot make its own image path appear as System32 just by file location.
  *
  * Build (from a VS Developer environment, x64):
  *   cl.exe /nologo /W4 /EHsc /LD ppid_spoof_trusted_broker_test.c /link /OUT:ppid_spoof_trusted_broker_test.dll
@@ -77,7 +41,6 @@ __declspec(dllexport) void CALLBACK RunTest(HWND hwnd, HINSTANCE hinst, LPSTR lp
     printf("[ppid_spoof_trusted_broker_test] host process (the REAL creator sensor.c will report) = %s, pid=%lu\n",
            selfPath, GetCurrentProcessId());
 
-    // --- Step 1: throwaway claimed-parent process --------------------------
     STARTUPINFOA fakeParentSi = { sizeof(fakeParentSi) };
     PROCESS_INFORMATION fakeParentPi = { 0 };
     char fakeParentCmd[] = "cmd.exe /c timeout /t 30 >nul";
@@ -90,7 +53,6 @@ __declspec(dllexport) void CALLBACK RunTest(HWND hwnd, HINSTANCE hinst, LPSTR lp
     }
     printf("[ppid_spoof_trusted_broker_test] claimed parent launched, pid=%lu\n", fakeParentPi.dwProcessId);
 
-    // --- Step 2: spoofed child, real creator = this host process -----------
     SIZE_T attrListSize = 0;
     InitializeProcThreadAttributeList(NULL, 1, 0, &attrListSize);
     LPPROC_THREAD_ATTRIBUTE_LIST attrList = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(

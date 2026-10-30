@@ -1,28 +1,9 @@
 /*
  * PPID-spoofing test harness for driver/sensor/sensor.c.
  *
- * Nothing else in this project exercises this technique - vm_eval.py's
- * scenario list deliberately excluded it (there was no way to prove
- * detection without a kernel sensor; see the Phase 2 task notes). This is
- * that proof.
- *
- * What it does:
- *   1. Launches a throwaway, harmless "fake parent" process (cmd.exe,
- *      sitting idle on a long timeout) and keeps its own, fully-privileged
- *      handle to it - we created it ourselves, so no extra access rights
- *      need to be requested.
- *   2. Uses STARTUPINFOEX + InitializeProcThreadAttributeList +
- *      UpdateProcThreadAttribute(PROC_THREAD_ATTRIBUTE_PARENT_PROCESS) -
- *      a documented Windows API, not an exploit - to launch a REAL child
- *      process while telling the OS its parent is the fake-parent process
- *      from step 1, not this test harness itself (the actual caller).
- *   3. Prints every PID involved so the operator can cross-check against
- *      what the driver reports in WinDbg:
- *        - this harness's own PID            = the REAL creator
- *        - the fake parent's PID             = the CLAIMED parent
- *        - the spoofed child's PID           = the new process sensor.c
- *          should report a PPID-SPOOF line for
- *   4. Cleans up both child processes afterward - nothing is left running.
+ * Nothing else in this project exercises PPID spoofing - vm_eval.py's
+ * scenario list deliberately excluded it (no way to prove detection
+ * without a kernel sensor). This is that proof.
  *
  * Build (from a VS Developer environment, x64):
  *   cl.exe /nologo /W4 /EHsc ppid_spoof_test.c /link /OUT:ppid_spoof_test.exe
@@ -36,7 +17,6 @@ static void fail(const char *what) {
 }
 
 int main(void) {
-    // --- Step 1: launch the throwaway "fake parent" ------------------------
     STARTUPINFOA fakeParentSi = { sizeof(fakeParentSi) };
     PROCESS_INFORMATION fakeParentPi = { 0 };
     char fakeParentCmd[] = "cmd.exe /c timeout /t 30 >nul";
@@ -47,7 +27,6 @@ int main(void) {
     }
     printf("[ppid_spoof_test] fake parent launched, pid=%lu\n", fakeParentPi.dwProcessId);
 
-    // --- Step 2: build the attribute list naming it as the claimed parent --
     SIZE_T attrListSize = 0;
     InitializeProcThreadAttributeList(NULL, 1, 0, &attrListSize);
     LPPROC_THREAD_ATTRIBUTE_LIST attrList = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(
@@ -86,7 +65,6 @@ int main(void) {
     // Give the sensor driver a moment to have fired before we tear down.
     Sleep(2000);
 
-    // --- Step 4: clean up - nothing left running afterward ------------------
     TerminateProcess(childPi.hProcess, 0);
     TerminateProcess(fakeParentPi.hProcess, 0);
     CloseHandle(childPi.hProcess);
