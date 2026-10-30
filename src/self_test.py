@@ -1,16 +1,9 @@
 """
-Benign, periodic self-test that proves the telemetry pipeline actually
-delivers real events end-to-end - not just that a sensor's heartbeat
-thread is alive (sensor_health.py's watchdog/blind-state already covers
-that: a thread can be alive and still silently see nothing real).
-
-Scoped honestly to what this prototype's actual sensors can prove:
-process-create visibility (Sysmon + ETW, the only two behavioral sensors
-this codebase has) and the alert-generation pipeline (logging ->
-AlertStore, web_server.py only). There is no file, memory, network, or
-cloud-delivery sensor in this codebase, so this module makes no claim
-about those - a self-test that silently reports "PASS" for telemetry it
-never actually checked would be worse than not having one at all.
+Periodic self-test that proves the telemetry pipeline delivers real events
+end-to-end, beyond just checking that heartbeat threads are alive.
+Scoped to what this codebase's sensors can actually prove (process-create
+visibility + alert pipeline). A self-test that reports PASS for unchecked
+telemetry is worse than not having one.
 """
 
 import logging
@@ -23,25 +16,15 @@ DEFAULT_INTERVAL_SECONDS = 300
 DEFAULT_TIMEOUT_SECONDS = 15
 DEFAULT_POLL_SECONDS = 0.5
 
-# Deliberately inert: exits immediately, touches no file, opens no network
-# connection, spawns no child of its own. Its parent is this EDR process
-# itself, never an Office app, so heuristic_engine.py's OFFICE_PARENTS ->
-# LOLBIN_CHILDREN rule (the only rule that scores cmd.exe at all)
-# structurally cannot fire on it - confirmed by reading that rule's guard
-# (`parent_name in OFFICE_PARENTS`) before choosing this command.
+# Inert: parent is this EDR process, never an Office app, so the
+# OFFICE_PARENTS -> LOLBIN_CHILDREN rule structurally cannot fire on it.
 _BENIGN_COMMAND = ["cmd.exe", "/c", "exit", "0"] if os.name == "nt" else ["/usr/bin/true"]
 
 
 class RecentPidSightings:
-    """Minimal on_event observer for entrypoints that don't already keep a
-    richer per-event history - main.py has nothing else using
-    HeuristicEngine.on_event, so it can wire this in directly.
-    web_server.py's Backend already has ProcessActivityStore for this
-    purpose and should reuse that instead of this class.
-
-    Tracks PIDs only, regardless of score - a genuinely benign self-test
-    process scores zero, so HeuristicEngine.process_scores (which only
-    holds scored PIDs) can never be used to answer "was this PID seen"."""
+    """Tracks observed PIDs regardless of score. Zero-scored self-test processes
+    won't appear in HeuristicEngine.process_scores - can't use that to detect them.
+    web_server.py's Backend uses ProcessActivityStore instead."""
 
     def __init__(self, maxlen=2000):
         self._pids = deque(maxlen=maxlen)
@@ -58,11 +41,8 @@ class RecentPidSightings:
 
 
 def check_process_visibility(pid_seen_fn, timeout=DEFAULT_TIMEOUT_SECONDS, poll_interval=DEFAULT_POLL_SECONDS):
-    """Spawns one real, inert OS process and polls `pid_seen_fn(pid)`
-    until it reports that PID has actually been observed by telemetry, or
-    `timeout` elapses. Returns (ok, pid) - `pid` is included even on
-    failure so the caller can log exactly which real process the pipeline
-    failed to see."""
+    """Spawn an inert process and poll until telemetry sees it or timeout elapses.
+    Returns (ok, pid); pid included on failure so the caller can log which PID was missed."""
     proc = subprocess.Popen(_BENIGN_COMMAND, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     pid = proc.pid
     try:
@@ -80,13 +60,8 @@ def check_process_visibility(pid_seen_fn, timeout=DEFAULT_TIMEOUT_SECONDS, poll_
 
 
 def check_alert_pipeline(alert_sink, timeout=DEFAULT_TIMEOUT_SECONDS, poll_interval=DEFAULT_POLL_SECONDS):
-    """Round-trips a canary line through the *real* logging pipeline (not
-    a direct call into alert_sink) and confirms it lands in `alert_sink`
-    (anything with .snapshot() returning dicts that have a "message" key -
-    e.g. web_server.AlertStore) - proves alert generation is actually
-    wired end-to-end, not just importable. Logged at INFO specifically so
-    a passing canary never inflates the dashboard's WARNING/CRITICAL
-    tiles - only a genuine finding should do that."""
+    """Send a canary through the real logging pipeline and confirm it lands in alert_sink.
+    Logged at INFO so a passing canary never inflates WARNING/CRITICAL tiles."""
     marker = f"self-test-canary-{time.monotonic_ns()}"
     logging.info(f"[SELF-TEST] alert pipeline canary {marker}")
     deadline = time.monotonic() + timeout
@@ -99,12 +74,8 @@ def check_alert_pipeline(alert_sink, timeout=DEFAULT_TIMEOUT_SECONDS, poll_inter
 
 
 def run_once(pid_seen_fn, alert_sink=None, timeout=DEFAULT_TIMEOUT_SECONDS):
-    """Runs every check that applies and returns {check_name: (ok, detail)}.
-    Never raises - a bug in one check must not prevent the other check (or
-    the caller's transition-based logging) from running. `alert_sink=None`
-    (e.g. main.py's headless CLI, which has no AlertStore) skips
-    alert_generation entirely rather than reporting a misleading result
-    for a pipeline stage that doesn't exist in that entrypoint."""
+    """Run all applicable checks; never raises so one failure doesn't skip others.
+    alert_sink=None skips the alert pipeline check (main.py headless CLI has no AlertStore)."""
     results = {}
 
     try:
@@ -124,14 +95,8 @@ def run_once(pid_seen_fn, alert_sink=None, timeout=DEFAULT_TIMEOUT_SECONDS):
 
 
 def self_test_loop(pid_seen_fn, alert_sink=None, interval=DEFAULT_INTERVAL_SECONDS, timeout=DEFAULT_TIMEOUT_SECONDS):
-    """Runs forever (call on a daemon thread), re-running run_once() every
-    `interval` seconds. Logs a result only on transition (pass -> fail or
-    fail -> pass) per check - same "log on transition, not every tick"
-    convention as sensor_health.watchdog_loop, so a long-healthy pipeline
-    doesn't spam the alert feed with a routine PASS every `interval`
-    seconds. Baseline is assumed passing, so a check that already fails on
-    its very first run is still logged immediately (fails loudly) rather
-    than treated as an already-known condition."""
+    """Run on a daemon thread. Logs only on pass/fail transitions to avoid spamming
+    the feed; baseline assumed passing so a first-run failure still logs immediately."""
     last_ok = {}
     while True:
         time.sleep(interval)

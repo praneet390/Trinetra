@@ -1,19 +1,8 @@
 """
-Additive, declarative detection layer: loads YAML rule files from
-rules/custom/*.yml and evaluates them alongside (never instead of) the
-hardcoded rules in heuristic_engine.py and static_scanner.py. Modeled on
-Velociraptor's artifact format and Sigma's structural-match style, but
-deliberately NOT a general expression/eval language - `match` is a
-constrained tree of {field, op, value} conditions under `all`/`any`. A
-custom rule pack is exactly the kind of thing that might eventually be
-shared like a Sigma pack; this tool must never let a rule *file* execute
-code.
-
-Every hit is routed through the engine's own _add_score()/add_static_score()
-- the protected-process floor, decay, and PID-reuse guard in
-heuristic_engine.py apply to a custom rule's score exactly as they do to
-every hardcoded one, because that logic lives in one place and this module
-never bypasses it.
+Declarative detection layer for YAML rule files alongside hardcoded rules.
+match is a constrained {field, op, value} tree - never eval/exec.
+Every hit routes through engine._add_score() so the protected-process floor,
+decay, and PID-reuse guard apply to custom rules exactly as to hardcoded ones.
 """
 
 import glob
@@ -33,10 +22,7 @@ EVENT_ID_TO_APPLIES_TO = {
     13: 'registry_event',
 }
 
-# Raw Sysmon field name -> normalized lowercase field name a rule reads,
-# per event type. Values are lowercased at normalization time so a rule
-# author never has to think about case, matching how every hardcoded rule
-# in heuristic_engine.py already behaves.
+# Values lowercased at normalization so rule authors never need to think about case.
 FIELD_MAP = {
     'process_create': {'Image': 'image', 'ParentImage': 'parent_image', 'CommandLine': 'command_line'},
     'process_access': {'SourceImage': 'source_image', 'TargetImage': 'target_image', 'GrantedAccess': 'granted_access'},
@@ -64,9 +50,7 @@ def _to_float(value):
 
 
 def _field_matches(field_value, op, expected):
-    """Uniform matcher for a field that may be a scalar or a list (e.g. a
-    static rule's imports_flat) - every op is defined as 'does at least one
-    of the field's value(s) satisfy this condition against `expected`'."""
+    """Match field_value (scalar or list) against expected; any single value satisfying the op returns True."""
     values = field_value if isinstance(field_value, (list, tuple, set)) else [field_value]
     values = [v for v in values if v is not None]
     if not values:
@@ -75,9 +59,7 @@ def _field_matches(field_value, op, expected):
     if op == 'equals':
         return any(str(v).lower() == str(expected).lower() for v in values)
     if op == 'contains':
-        # `value` may be a single substring or a list of candidate
-        # substrings ("does the field contain ANY of these") - the common
-        # case for matching a full path against a list of bare filenames.
+        # value may be a list of candidate substrings (field contains ANY of these).
         candidates = expected if isinstance(expected, (list, tuple)) else [expected]
         return any(str(c).lower() in str(v).lower() for c in candidates for v in values)
     if op == 'in':

@@ -1,33 +1,11 @@
 """
-Third, independent telemetry sensor: the kernel driver (driver/sensor/
-sensor.c), consumed over its user-mode comms channel (a device + one
-polling IOCTL, GET_EVENT - see that file's header comment for exactly
-which event types it forwards and why, and why they're deliberately
-scoped down from everything the driver can see under a live debugger).
-Same decoupled shape as telemetry_monitor.py/etw_monitor.py: a bounded
-queue between event delivery and a separate scoring-worker thread, so a
-slow scoring pass can never stall event delivery - except here the
-"producer" is this module's own polling thread, not an OS-delivered
-callback, since the driver's comms channel is itself poll-based (a
-bounded circular queue drained by IOCTL, not a pending-IRP push model -
-the simpler of the two, deliberately shipped first; see sensor.c).
+Kernel driver sensor (driver/sensor/sensor.c) consumed via polling IOCTL.
+Same bounded-queue/scoring-worker decoupling as telemetry_monitor.py/etw_monitor.py.
 
-Unlike Sysmon/ETW, this sensor is KERNEL GROUND TRUTH for process
-ancestry (PsSetCreateProcessNotifyRoutineEx's CreatingThreadId field
-cannot be influenced by PROC_THREAD_ATTRIBUTE_PARENT_PROCESS the way
-Sysmon/ETW's claimed-parent field can) and for LSASS handle-access
-observation (ObRegisterCallbacks' pre-operation callback runs before the
-OS's own access check, PPL caveats noted in sensor.c's own header) - see
-heuristic_engine.py's evaluate_kernel_lsass_access/kernel_ppid_spoof
-check and process_correlator.submit_kernel.
-
-Requires the sensor.sys driver already built+signed (see driver/sensor/)
-- this module does NOT build or sign it, only starts/stops the already-
-registered Windows service (ensure_driver_running/stop_driver_service)
-and talks to its comms channel. A missing/not-yet-loaded/untrusted
-driver is a normal, non-fatal "sensor unavailable" condition here, the
-same posture as Sysmon not being installed - the agent degrades, it
-does not fail to start.
+KERNEL GROUND TRUTH: PsSetCreateProcessNotifyRoutineEx's CreatingThreadId can't be
+influenced by PROC_THREAD_ATTRIBUTE_PARENT_PROCESS (unlike Sysmon/ETW's claimed-parent),
+and ObRegisterCallbacks pre-op runs before the OS access check (PPL caveats in sensor.c).
+A missing/unsigned driver is non-fatal - agent degrades, same as Sysmon not being installed.
 """
 
 import logging
@@ -47,10 +25,7 @@ except ImportError:  # pragma: no cover - Windows-only, see conftest.py
 DEVICE_PATH = r'\\.\malprojectsensor'
 SERVICE_NAME = 'sensor'
 
-# Mirrors the WDK's CTL_CODE macro exactly (ntddk.h) - computed, not
-# re-typed as hex constants, so this can never silently drift from
-# driver/sensor/sensor.c's own IOCTL_MALPROJECT_* definitions as long as
-# the three inputs below (device type, function, method/access) match.
+# Computed (not hex constants) to stay in sync with sensor.c's CTL_CODE definitions.
 FILE_DEVICE_UNKNOWN = 0x00000022
 METHOD_BUFFERED = 0
 FILE_ANY_ACCESS = 0
@@ -71,13 +46,9 @@ EVENT_TYPE_DRIVER_LOAD = 3
 
 IMAGE_NAME_MAX_CHARS = 260
 
-# struct layout mirrors SENSOR_EVENT in sensor.c field-for-field. '<' (no
-# padding) is correct here because the C struct itself has zero padding -
-# every ULONG64 already falls on an 8-byte boundary by construction (see
-# that struct's own layout comment), so there is nothing for alignment
-# padding to insert on either side. Q=ULONG64, I=ULONG, {n}s=raw bytes for
-# the fixed WCHAR[260] buffer (decoded separately below, not as a Python
-# string field, since it's UTF-16-LE and NUL-terminated mid-buffer).
+# Mirrors SENSOR_EVENT field-for-field. '<' (no padding): every ULONG64 falls on an
+# 8-byte boundary by construction, so the C struct itself has zero padding.
+# ImageName is decoded separately (UTF-16-LE, NUL-terminated mid-buffer).
 _EVENT_FORMAT = f'<QIIQQQQII{IMAGE_NAME_MAX_CHARS * 2}s'
 EVENT_SIZE = struct.calcsize(_EVENT_FORMAT)
 
@@ -95,25 +66,15 @@ _DRIVER_SYS_CANDIDATES = (
 
 
 def parse_event(raw_bytes):
-    """Unpack one SENSOR_EVENT's raw bytes into a plain dict. Pure function
-    (no I/O), so it's testable with synthetic bytes shaped like the real
-    driver's wire format - the same way etw_monitor's _on_etw_event tests
-    don't need a real ETW session. Raises struct.error on a short/malformed
-    buffer; callers are expected to catch that, not this function."""
+    """Unpack one SENSOR_EVENT into a dict. Pure function - testable without a driver.
+    Raises struct.error on short/malformed input; callers catch it."""
     (seq, event_type, ppid_spoof, pid, field2, field3, field4,
      name_truncated, _reserved, raw_name) = struct.unpack(_EVENT_FORMAT, raw_bytes)
 
-    # The driver NUL-terminates ImageName; cut at the first NUL *character*
-    # (a char-aligned, even-offset b'\x00\x00' pair) before decoding, so a
-    # short name never carries trailing garbage from the rest of the fixed
-    # buffer. A single find() is NOT enough: every ASCII WCHAR is encoded
-    # as [byte, 0x00], so the LAST real character's own high byte (always
-    # at an odd offset - char k occupies bytes [2k, 2k+1]) sits directly
-    # next to the first padding byte, forming a spurious b'\x00\x00' at an
-    # odd offset that is always found BEFORE the true, even-offset
-    # boundary. Must keep searching past a misaligned match, not stop at
-    # it - confirmed by a real test failure (an 8-char name's trailing
-    # NUL bytes were never cut), not assumed.
+    # Cut at the first even-aligned b'\x00\x00' pair (UTF-16-LE NUL character).
+    # A naive single find() hits the spurious odd-offset b'\x00\x00' formed by an
+    # ASCII char's high byte + first padding byte - confirmed by real test failure
+    # (8-char name's NUL terminator was never found).
     search_from = 0
     nul_index = -1
     while True:
@@ -150,11 +111,8 @@ def parse_event(raw_bytes):
 
 
 def _dispatch_event(event, correlator, engine):
-    """Routes one parsed event dict to the engine/correlator. Mirrors
-    etw_monitor._scoring_worker's per-event-type dispatch shape - an
-    unrecognized event_type is logged and skipped, never raised, since a
-    newer driver build could in principle add a type this older agent
-    build doesn't know about yet."""
+    """Route one parsed event to engine/correlator. Unknown event_type is logged and
+    skipped (not raised) - a newer driver build may add types this agent doesn't know."""
     event_type = event['event_type']
     if event_type == EVENT_TYPE_PROCESS_CREATE:
         correlator.submit_kernel(
@@ -177,10 +135,7 @@ def _dispatch_event(event, correlator, engine):
 
 
 def _scoring_worker(engine, correlator, event_queue):
-    """Drains parsed event dicts off the queue and routes them, on a
-    thread separate from the poll loop - same decoupling rationale as
-    every other sensor's scoring worker: a slow rule/engine pass must
-    never stall the thread actually reading the driver's queue."""
+    """Drain events from the queue on a separate thread so slow scoring never stalls polling."""
     while True:
         event = event_queue.get()
         try:
@@ -190,13 +145,9 @@ def _scoring_worker(engine, correlator, event_queue):
 
 
 def _record_sequence_gap(event, last_seq_holder, on_drop):
-    """Detects a gap in SequenceNumber (the driver's own dropped-event
-    signal - see sensor.c's SensorEnqueueEvent, which overwrites the
-    oldest queued entry rather than blocking when its bounded buffer is
-    full) and calls on_drop() once per missing sequence number, so this
-    sensor's SensorHealth.record_drop() count means the same thing every
-    other sensor's does: how many events were actually lost, not just
-    "a drop happened at some point"."""
+    """Calls on_drop() once per gap in SequenceNumber (driver overwrites oldest
+    entry when its bounded buffer is full) so the drop count matches what other
+    sensors report: events actually lost, not "a drop happened"."""
     seq = event['sequence_number']
     prev = last_seq_holder[0]
     if prev is not None and seq > prev + 1 and on_drop:
@@ -207,16 +158,9 @@ def _record_sequence_gap(event, last_seq_holder, on_drop):
 
 
 def _poll_loop(handle, event_queue, stop_event, on_heartbeat=None, on_drop=None, last_seq_holder=None):
-    """Runs on its own thread: repeatedly issues the GET_EVENT IOCTL,
-    waiting briefly between empty polls rather than busy-spinning. A
-    0-byte/short result means "nothing queued right now" (see sensor.c's
-    SensorDispatchDeviceControl) - an ordinary, expected result, not an
-    error and not a reason to stop polling. An actual IOCTL failure (the
-    device/driver went away) backs off further and keeps retrying, the
-    same "never permanently give up" posture telemetry_monitor.py and
-    etw_monitor.py already take - a sensor that stops polling after one
-    transient failure would look identical to one that was never alive,
-    which sensor_health.py's whole point is to distinguish."""
+    """Poll GET_EVENT IOCTL on its own thread. 0-byte/short result = nothing queued,
+    not an error. IOCTL failure backs off and keeps retrying - never stops permanently,
+    so a transient failure doesn't make a live sensor look dead to sensor_health.py."""
     while not stop_event.is_set():
         try:
             raw = win32file.DeviceIoControl(handle, IOCTL_GET_EVENT, None, EVENT_SIZE, None)
@@ -249,19 +193,9 @@ def _poll_loop(handle, event_queue, stop_event, on_heartbeat=None, on_drop=None,
 
 
 def start_kernel_monitor(engine, correlator, on_heartbeat=None, on_drop=None):
-    """Opens the already-loaded driver's comms channel, registers this
-    process as self-protected (see sensor.c's IOCTL_MALPROJECT_REGISTER_
-    SELF - best-effort, logged not raised, since a failure here must not
-    stop the sensor itself from coming up), and starts polling. Returns a
-    truthy session object on success, None if the driver isn't loaded/
-    reachable - the same "unavailable sensor" contract every other sensor
-    in this project follows (see sensor_health.sensor_label: a falsy
-    handle means "never came up", distinct from a live one going stale).
-
-    Does NOT start the driver service itself - see ensure_driver_running(),
-    called separately by the agent's own startup sequence before this, so
-    service lifecycle and per-process comms-channel listening stay
-    independently controllable."""
+    """Open the driver's comms channel and start polling. Returns None if the driver
+    isn't loaded (non-fatal; agent degrades). Self-protection registration is best-effort
+    (logged, not raised). Does NOT start the service - call ensure_driver_running() first."""
     if win32file is None:
         logging.error("[KERNEL] pywin32 not available - kernel sensor cannot start")
         return None
@@ -297,9 +231,7 @@ def start_kernel_monitor(engine, correlator, on_heartbeat=None, on_drop=None):
 
 
 def stop_kernel_monitor(session):
-    """Stop the session start_kernel_monitor() returned. Safe to call with
-    None (the sensor never started) and never raises - same contract as
-    stop_etw_monitor(session=None)."""
+    """Stop the polling session. Safe with None; never raises."""
     if session is None:
         return
     try:
@@ -322,18 +254,9 @@ def stop_kernel_monitor(session):
 
 
 def ensure_driver_running(sys_path=None):
-    """Creates (if needed) and starts the 'sensor' kernel-driver Windows
-    service, idempotently - safe to call on every agent startup, the same
-    "just make sure it's up" posture as Sysmon's own install-if-needed
-    story in the README. Returns True if the service ends up RUNNING,
-    False otherwise - never raises. A missing/unsigned/untrusted driver
-    binary is a normal "sensor unavailable this run" condition, not a
-    fatal agent-startup error, the same posture as Sysmon not being
-    installed.
-
-    Does NOT build or sign the driver - see driver/sensor/ for that
-    one-time step (and its own cert/trust-store prerequisites). This only
-    drives the already-signed binary's service lifecycle."""
+    """Idempotently create and start the 'sensor' kernel-driver service.
+    Returns True if running, False otherwise; never raises. Does NOT build or sign
+    the driver - see driver/sensor/ for that one-time step."""
     if win32service is None:
         return False
     sys_path = sys_path or next((p for p in _DRIVER_SYS_CANDIDATES if os.path.exists(p)), None)
@@ -380,10 +303,7 @@ def ensure_driver_running(sys_path=None):
 
 
 def stop_driver_service():
-    """Stops (but does not delete - a clean reload stays a two-command
-    `sc stop`/`sc start` away, not a full reinstall) the 'sensor' service.
-    Called on clean agent shutdown, mirroring stop_etw_monitor's own
-    lifecycle symmetry with its start function. Never raises."""
+    """Stop (not delete) the 'sensor' service. Never raises."""
     if win32service is None:
         return
     scm = svc = None

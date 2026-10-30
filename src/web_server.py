@@ -171,24 +171,10 @@ def api_process_live(pid_str):
 
 def api_process_ancestry(backend, pid_str):
     """GET /api/processes/<pid>/ancestry - the Memory Ancestry Graph feed.
-
-    Returns the FULL ancestry (every known ancestor with PID/PPID/command
-    line/user/spawn time/first-seen, EXEC-labeled edges, best-effort env
-    blocks for still-alive nodes) plus the engine's forensic snapshot for
-    the PID if one was captured at detection time - the snapshot is what
-    survives mitigation, so the panel shows it whenever it exists even for
-    a now-dead process. 404 when NEITHER source knows the PID.
-
-    COMPLETE-CHAIN MERGE: the graph presented here is the full attack
-    chain, not two artifacts. Access edges (MMAP(RWX)/CREATETHREAD/
-    OpenProcess - Sysmon Event 10 connections) live in the engine's own
-    bounded store and can be observed AFTER the threshold snapshot was
-    frozen (snapshots are first-wins evidence and are never rewritten), so
-    this endpoint merges the engine's current access edge into the
-    presented ancestry as a kind='access' edge. The merge only ever ADDS
-    the observed connection - birth edges stay EXEC-labeled from the
-    tracker, the stored snapshot stays untouched, and if no access edge
-    was ever observed the graph is exactly what the trackers recorded."""
+    Returns the full ancestry (EXEC-labeled edges) plus the forensic snapshot when one exists.
+    The snapshot survives mitigation; 404 when neither source knows the PID.
+    Merges the engine's live access edge (kind='access') into the ancestry so birth + injection
+    form one graph; the snapshot itself is never rewritten."""
     try:
         pid = int(pid_str)
     except (TypeError, ValueError):
@@ -200,11 +186,7 @@ def api_process_ancestry(backend, pid_str):
         return {"error": "no ancestry or forensic snapshot recorded for this pid", "pid": pid}, 404
 
     if isinstance(ancestry, dict):
-        # Prefer the engine's live edge store (the most recent
-        # observation); fall back to the snapshot's frozen trigger_edge
-        # for the case where the bounded LRU already evicted it but the
-        # snapshot preserved a copy. Never duplicates: a graph that
-        # already carries a kind='access' edge is complete.
+        # Prefer live edge store; fall back to snapshot's frozen trigger_edge if evicted from LRU.
         edge = backend.engine._access_edge_for(pid) or (snapshot or {}).get('trigger_edge')
         if edge is not None and not any(e.get('kind') == 'access' for e in ancestry.get('edges', [])):
             merged = dict(edge)
@@ -333,9 +315,7 @@ class Backend:
         logging.getLogger().addHandler(AlertLogHandler(self.alert_store))
         logging.getLogger().setLevel(logging.INFO)
 
-        # Additive YAML rule pack + config-driven tunables - same instances
-        # main.py's CLI entrypoint constructs, so the dashboard and the CLI
-        # never quietly diverge in what they detect.
+        # Same instances main.py's CLI constructs, so the dashboard and CLI never diverge in what they detect.
         self.rules = RuleEngine()
         self.config = load_config()
         self.engine = HeuristicEngine(rule_engine=self.rules, config=self.config)
@@ -352,11 +332,7 @@ class Backend:
         self.sysmon_health = SensorHealth("sysmon")
         self.etw_health = SensorHealth("etw")
         self.kernel_health = SensorHealth("kernel")
-        # Wire the Memory Ancestry Graph provider: when the engine captures
-        # a forensic snapshot at detection time it walks THIS tracker's
-        # parent/child map (the same one feeding the Process Explorer
-        # Lineage column) via this callback - same after-the-fact wiring
-        # pattern as engine.correlator above.
+        # Wire ancestry provider so forensic snapshots walk this tracker's parent/child map.
         self.engine.ancestry_provider = self.process_tracker.get_ancestry
 
     def _on_raw_event(self, event_id, data):
@@ -389,13 +365,7 @@ class Backend:
         self._etw_handle = start_etw_monitor(self.engine, on_heartbeat=self.etw_health.touch,
                                              correlator=self.correlator, on_drop=self.etw_health.record_drop)
 
-        # Third, independent kernel sensor (driver/sensor/sensor.c) - ground
-        # truth for process ancestry and LSASS handle-access, unlike Sysmon/
-        # ETW's claimed-parent field. A missing/not-yet-loaded driver is a
-        # normal "sensor unavailable" condition, same as Sysmon not being
-        # installed - ensure_driver_running() only starts the already-
-        # built-and-signed service (see kernel_sensor.py's own docstring);
-        # it never builds or signs anything itself.
+        # Kernel sensor: ground truth for ancestry and LSASS access. Missing driver = "sensor unavailable", same as Sysmon absent.
         ensure_driver_running()
         self._kernel_handle = start_kernel_monitor(self.engine, self.correlator,
                                                     on_heartbeat=self.kernel_health.touch,
@@ -414,10 +384,7 @@ class Backend:
 
         threading.Thread(target=self._module_sweep_loop, daemon=True).start()
 
-        # Benign, periodic self-test (see self_test.py) - proves the
-        # telemetry pipeline actually delivers real events end-to-end, and
-        # (only here, since this is the entrypoint with an AlertStore) that
-        # the alert-generation pipeline is actually wired.
+        # Periodic self-test (see self_test.py): proves the telemetry pipeline delivers real events end-to-end.
         threading.Thread(
             target=self_test_loop,
             args=(self._pid_seen, self.alert_store),
@@ -434,10 +401,7 @@ class Backend:
         pywintrace's consumer thread is the one that isn't. Idempotent."""
         etw_session, self._etw_handle = self._etw_handle, None
         stop_etw_monitor(etw_session)
-        # Unregisters self-protection and closes the comms channel, then
-        # stops (not deletes) the service - mirrors the ETW session's own
-        # start/stop symmetry above. Safe to call even if the kernel sensor
-        # never started.
+        # Stops (not deletes) the service. Safe to call even if the kernel sensor never started.
         kernel_session, self._kernel_handle = self._kernel_handle, None
         stop_kernel_monitor(kernel_session)
         stop_driver_service()
@@ -472,58 +436,29 @@ class Backend:
     def summary(self):
         alerts = self.alert_store.snapshot()
         last_event = self.engine.last_event_time
-        # 'unavailable' means the sensor never came up at startup (e.g.
-        # EvtSubscribe/ETW trace failed) - permanent for this run. 'stale'/
-        # 'live' come from SensorHealth's heartbeat, computed fresh on every
-        # call so a sensor dying mid-run (e.g. `sc stop sysmon64`) is
-        # reflected here without needing sensor_status to be re-set anywhere.
+        # 'unavailable' = never came up (permanent this run); 'stale'/'live' from SensorHealth heartbeat, fresh per call.
         sysmon_label = sensor_label(self._sysmon_handle, self.sysmon_health)
         etw_label = sensor_label(self._etw_handle, self.etw_health)
-        # Third, independent kernel-driver sensor (driver/sensor/sensor.c via
-        # kernel_sensor.py) - ground truth for process ancestry and LSASS
-        # handle-access. A missing/unsigned/not-yet-loaded driver is a normal
-        # "sensor unavailable" condition, same as Sysmon not being installed.
+        # Kernel-driver: ground truth for ancestry and LSASS access; missing driver = "unavailable".
         kernel_label = sensor_label(self._kernel_handle, self.kernel_health)
         blind_state = self._blind_state()
         return {
             "hostname": socket.gethostname(),
             "session_start": self.session_start,
             "sensor_status": f"Sysmon: {sysmon_label} | ETW: {etw_label} | Kernel: {kernel_label}",
-            # Per-sensor liveness (see sensor_health.py) - observe-only, not
-            # auto-restarted. A stale sensor doesn't mean detection stopped:
-            # the other sensors (and the correlator's sysmon-only/etw-only
-            # fallback dispatch) keep working independently.
             "sysmon_stale": self.sysmon_health.is_stale(),
             "etw_stale": self.etw_health.is_stale(),
             "kernel_stale": self.kernel_health.is_stale(),
-            # Structured per-sensor state ("live"/"stale"/"unavailable") for
-            # the dashboard's sensor-health gauge - sensor_status above is
-            # the same information as one display string, kept for the
-            # existing badge rendering.
             "sysmon_state": sysmon_label,
             "etw_state": etw_label,
             "kernel_state": kernel_label,
-            # Events a sensor observed but had to discard because its bounded
-            # queue was full (all time, this run) - the size of the visibility
-            # hole behind a "lossy" state.
+            # Drops = events observed but discarded because the bounded queue was full (all time, this run).
             "sysmon_dropped_events": self.sysmon_health.drops_total(),
             "etw_dropped_events": self.etw_health.drops_total(),
             "kernel_dropped_events": self.kernel_health.drops_total(),
-            # Per-event cross-check between the kernel driver and ETW (see
-            # process_correlator.witness_stats): gap counts per sensor, the
-            # sensors currently silent, and how often the ETW-header creator
-            # agreed with the driver's real creator.
             "witness": self.correlator.witness_stats(),
-            # Aggregate visibility state (see sensor_health.compute_blind_state)
-            # - HEALTHY/DEGRADED/PARTIALLY_BLIND/CRITICALLY_BLIND, driven by
-            # telemetry integrity rather than just "is the process running".
             "blind_state": blind_state,
-            # Negative-evidence protection (threat-model item #19): whether
-            # the alert counts below can actually be read as "no activity
-            # observed" (only true when blind_state is HEALTHY) versus
-            # "activity could not be observed" - and a human-readable reason
-            # why, for the dashboard to show directly next to those counts
-            # rather than making a viewer infer it from blind_state alone.
+            # Negative-evidence flag: alert counts can only be read as "no activity" when blind_state is HEALTHY.
             "negative_evidence_reliable": blind_state == BLIND_STATE_HEALTHY,
             "visibility_caveat": negative_evidence_caveat(blind_state),
             "thresholds": self.config['thresholds'],
@@ -532,26 +467,16 @@ class Backend:
             "warning_count": sum(1 for a in alerts if a["severity"] == "WARNING"),
             "processes_monitored": len(self.engine.process_scores),
             "samples_scanned": len(self.engine.static_scores),
-            # Raw telemetry heartbeat - most process/file/registry activity
-            # matches none of the suspicious patterns in heuristic_engine.py
-            # and produces no alert by design, which looks identical to "the
-            # Sysmon subscription is dead" from the dashboard alone. This is
-            # what actually proves events are flowing in real time.
+            # Proves events flow in real time - benign activity produces no alert but must still be visible.
             "telemetry_events_seen": self.engine.total_events_seen,
             "seconds_since_last_event": (time.time() - last_event) if last_event else None,
         }
 
 
 class DashboardServer(ThreadingHTTPServer):
-    # http.server.HTTPServer sets allow_reuse_address=1, which on Windows
-    # lets a *second* process bind the same host:port while the first is
-    # still listening - no error, no warning, just two independent servers
-    # silently sharing one port and round-robining requests across two
-    # completely different in-memory HeuristicEngine states. That's exactly
-    # what happened here: repeated runs left multiple elevated instances
-    # alive, and the dashboard looked "wrong" because every poll could land
-    # on a different one. A genuine second instance must fail loudly
-    # (Address already in use) instead of silently corrupting the data.
+    # HTTPServer sets allow_reuse_address=1; on Windows that lets two processes share one port silently.
+    # Observed live: repeated runs left multiple elevated instances, and each poll landed on a different
+    # in-memory HeuristicEngine. A second instance must fail loudly instead.
     allow_reuse_address = False
 
 
@@ -712,16 +637,8 @@ def _wait_for_dashboard(timeout, interval=0.5):
 
 
 def main():
-    # force=True is load-bearing, not stylistic: importing etw_monitor (via
-    # `from etw import ...`) pulls in pywintrace's etw/common.py, which
-    # calls logging.basicConfig(level=logging.ERROR) as an import-time side
-    # effect - before this line ever runs. logging.basicConfig() is a no-op
-    # once any handler exists, so without force=True this call would
-    # silently lose (confirmed live: it left the whole app logging in
-    # pywintrace's bare ERROR-only, default-format setup instead of ours).
-    # Safe to force here specifically because nothing else has added a
-    # handler yet at this point in startup - Backend() (which adds
-    # AlertLogHandler) isn't constructed until further down this function.
+    # force=True: pywintrace calls basicConfig(ERROR) at import time; without force this call is silently ignored.
+    # Safe here because Backend() (which adds AlertLogHandler) isn't constructed until later.
     logging.basicConfig(level=logging.INFO, format='[*] %(message)s', force=True)
 
     if _wait_for_dashboard(timeout=0):

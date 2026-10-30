@@ -1,25 +1,12 @@
 """
-Second, independent telemetry sensor: Microsoft-Windows-Kernel-Process via
-ETW, consumed directly (not through Sysmon/the Windows Event Log). Same
-decoupled shape as telemetry_monitor.py's Sysmon path - a bounded queue
-between the ETW consumer callback and a separate scoring-worker thread, so
-a slow scoring pass can never stall event delivery.
+Microsoft-Windows-Kernel-Process ETW sensor (direct, not via Sysmon/Event Log).
+Bounded queue between the callback and scoring thread - slow scoring never stalls
+event delivery.
 
-Empirically confirmed on a real Windows 11 machine via `Get-WinEvent
--ListProvider Microsoft-Windows-Kernel-Process`: the raw kernel
-ProcessStart event (task ID 1) only ever carries ProcessID, CreateTime,
-ParentProcessID, SessionID, ImageName - no CommandLine, no parent *image
-path* (only a parent PID). That's a real, permanent capability gap versus
-Sysmon (whose CommandLine capture is Sysmon's own enrichment work) - see
-HeuristicEngine.evaluate_etw_process_start's docstring for how that's
-handled (CommandLine/ParentImage set to None, so command-line-dependent
-rules structurally cannot fire on this thin data, correctly, with no
-special-casing).
-
-Starting a real-time ETW trace session needs Administrator
-(SeSystemProfilePrivilege) - identical requirement to Sysmon's
-EvtSubscribe, so web_server.py's existing self-elevation already covers
-both sensors with no new UAC prompt.
+Confirmed via `Get-WinEvent -ListProvider Microsoft-Windows-Kernel-Process`:
+ProcessStart only carries PID/CreateTime/ParentPID/SessionID/ImageName - no
+CommandLine (a real, permanent capability gap vs Sysmon). Command-line-dependent
+rules structurally cannot fire on this thin data; see evaluate_etw_process_start.
 """
 
 import logging
@@ -28,67 +15,36 @@ import threading
 
 from etw import ETW, GUID, ProviderInfo
 
-# pywintrace's own internal logger (etw/etw.py: logging.getLogger(__name__)
-# == "etw.etw") logs a WARNING for every single field TDH can't format -
-# confirmed via a real elevated run that Kernel-Process ProcessStart events
-# routinely fail to decode their Flags/SecurityMitigations fields this way
-# (pywintrace handles it gracefully itself: sets the field to None and
-# keeps parsing the rest of the event - neither field is one this module
-# reads). Left at WARNING, every process launch on the system would emit
-# these as root-logger records, which AlertLogHandler (web_server.py) turns
-# into dashboard alerts - flooding the Detections feed with internal
-# library noise. Raised to ERROR only for this specific logger, so a
-# genuine problem (e.g. logger.error() on an exception inside our own
-# event callback, at etw/etw.py's dispatch site) still surfaces.
+# pywintrace logs WARNING for every field TDH can't decode - confirmed on a live
+# run that Flags/SecurityMitigations routinely fail (pywintrace handles it fine;
+# neither field is used here). Left at WARNING those emit as root-logger records
+# which AlertLogHandler turns into dashboard alerts. Raised to ERROR so genuine
+# errors (exceptions in our own callback) still surface.
 logging.getLogger('etw.etw').setLevel(logging.ERROR)
 
-# Microsoft-Windows-Kernel-Process. GUID confirmed on this machine via
-# `wevtutil gp Microsoft-Windows-Kernel-Process`.
 KERNEL_PROCESS_PROVIDER_NAME = "Microsoft-Windows-Kernel-Process"
+# GUID confirmed via `wevtutil gp Microsoft-Windows-Kernel-Process`.
 KERNEL_PROCESS_PROVIDER_GUID = "{22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716}"
-
-# Task ID for the ProcessStart event within that provider (confirmed via
-# Get-WinEvent -ListProvider): 1 = ProcessStart, 2 = ProcessStop, 3/4 =
-# ThreadStart/Stop, 5 = ImageLoad. Only ProcessStart is consumed here.
+# Task IDs confirmed via Get-WinEvent -ListProvider: 1=ProcessStart, 2=Stop, 3/4=Thread, 5=ImageLoad.
 TASK_PROCESS_START = 1
 
 EVENT_QUEUE_MAXSIZE = 2000
 
-# Confirmed via `logman query providers "Microsoft-Windows-Kernel-Process"`:
-# enabling this provider with no keyword filter (pywintrace's default) also
-# emits WINEVENT_KEYWORD_THREAD/IMAGE/CPU_PRIORITY/etc for every thread start
-# and image load system-wide - a live 8s capture measured 17358 of 17360
-# total events LOST to buffer overflow, starving out the process-start events
-# this module actually wants. Restricting to just this keyword cuts the
-# volume to process start/stop only.
+# Without this keyword filter a live 8s capture measured 17358/17360 events LOST
+# to buffer overflow (WINEVENT_KEYWORD_THREAD/IMAGE/CPU_PRIORITY flooded the buffer).
+# Restricting to PROCESS cuts volume to process start/stop only.
 WINEVENT_KEYWORD_PROCESS = 0x10
 
 
 def _on_etw_event(event_tufo, event_queue, on_heartbeat=None, on_drop=None):
-    """pywintrace's ETW callback shape: event_tufo = (event_id, event_dict).
-    Filters to ProcessStart, extracts the thin field set, enqueues a plain
-    tuple (not the raw event_dict) so the scoring worker doesn't need to
-    know anything about pywintrace's decoding conventions. Mirrors
-    telemetry_monitor.on_sysmon_event: do the minimum here, hand off the
-    rest, never block this callback on scoring.
-
-    The queued tuple is (pid, parent_pid, image_name, create_time,
-    creator_pid). creator_pid is the process ID in the ETW event HEADER
-    (pywintrace exposes it as event["EventHeader"]["ProcessId"], a raw int
-    straight from the EVENT_HEADER struct - distinct from the payload's
-    "ProcessID", which is the NEW process). For a ProcessStart the header
-    pid is the process that generated the event, i.e. the creating process;
-    Fibratus (real_ppid) and Velociraptor (Windows.ETW.KernelProcess) both
-    rely on that. It is None when the header carries no ProcessId."""
+    """Enqueues (pid, parent_pid, image_name, create_time, creator_pid).
+    creator_pid is from the ETW event HEADER (EventHeader.ProcessId) - the process
+    that generated the event, i.e. the actual creating process, not the payload's
+    ProcessID (the new process). Same approach as Fibratus/Velociraptor."""
     try:
         _event_id, event = event_tufo
-        # pywintrace uppercases the manifest task name before handing it to
-        # the callback (etw/etw.py: `task_name = task_name.strip().upper()`
-        # - confirmed by reading pywintrace's source this session), so this
-        # can never be the literal string "ProcessStart". Match normalized
-        # (whitespace-stripped, uppercased) text, plus the nested numeric
-        # Task ID as a second, independent signal - Get-WinEvent already
-        # confirmed ProcessStart is task ID 1 on this provider.
+        # pywintrace uppercases manifest task names (etw/etw.py: task_name.strip().upper()),
+        # so "ProcessStart" arrives as "PROCESSSTART". Match both name and numeric task ID.
         task_name = "".join(str(event.get("Task Name", "")).split()).upper()
         task_id = event.get("EventHeader", {}).get("EventDescriptor", {}).get("Task")
         if task_name != "PROCESSSTART" and task_id != TASK_PROCESS_START:
@@ -102,9 +58,7 @@ def _on_etw_event(event_tufo, event_queue, on_heartbeat=None, on_drop=None):
         logging.error(f"[ETW] Error extracting fields from a Kernel-Process event: {e}")
         return
 
-    # A ProcessStart that carries no ProcessID is unusable (the worker will
-    # log an error scoring it), so it must not count as the sensor being alive.
-    # It is still queued so that error is recorded rather than swallowed.
+    # No ProcessID = unusable; don't count as heartbeat, but still queue for error logging.
     if on_heartbeat and pid is not None:
         on_heartbeat()
 
@@ -117,14 +71,8 @@ def _on_etw_event(event_tufo, event_queue, on_heartbeat=None, on_drop=None):
 
 
 def _scoring_worker(engine_instance, event_queue, correlator=None):
-    """Drains (pid, parent_pid, image_name, create_time[, creator_pid])
-    tuples off the queue and runs them through the heuristic engine (or the
-    correlator, if one is wired in - see start_etw_monitor), on a thread
-    separate from the ETW consumer callback above. A 4-tuple (no creator
-    pid) is accepted too. creator_pid is passed to the correlator only when
-    known, so a correlator or wrapper written before it existed keeps
-    working unchanged; the no-correlator path never uses it (the creator
-    cross-checks live in the correlator)."""
+    """Drains tuples from the queue on a thread separate from the ETW callback.
+    Accepts 4- or 5-tuples (creator_pid optional for backward compatibility)."""
     while True:
         pid, parent_pid, image_name, create_time, *rest = event_queue.get()
         creator_pid = rest[0] if rest else None
@@ -153,19 +101,11 @@ def start_etw_monitor(engine_instance, on_heartbeat=None, correlator=None, on_dr
         def _callback(event_tufo):
             _on_etw_event(event_tufo, event_queue, on_heartbeat=on_heartbeat, on_drop=on_drop)
 
-        # ProviderInfo stores whatever `guid` it's given verbatim, and
-        # pywintrace's EventProvider.start()/stop() later does
-        # ct.byref(provider.guid) - which needs a real ctypes GUID
-        # structure, not a plain string. Confirmed by reading pywintrace's
-        # source and by an actual run: passing the bare string here raised
-        # "byref() argument 1 must be _ctypes._CData, not str".
-        # GUID(string) converts via Windows' own CLSIDFromString.
+        # GUID() converts the string via CLSIDFromString; passing a bare string raises
+        # "byref() argument 1 must be _ctypes._CData, not str" at start()/stop() time.
         provider = ProviderInfo(KERNEL_PROCESS_PROVIDER_NAME, GUID(KERNEL_PROCESS_PROVIDER_GUID),
                                  any_keywords=WINEVENT_KEYWORD_PROCESS)
         etw_session = ETW(providers=[provider], event_callback=_callback)
-        # ETW.start() is non-blocking - EventConsumer.start() (which it
-        # delegates to internally) spawns its own consumer thread and
-        # returns immediately, so no extra threading wrapper is needed here.
         etw_session.start()
 
         logging.info("[+] ETW kernel-process capture active. Awaiting real-time events...")
@@ -176,18 +116,12 @@ def start_etw_monitor(engine_instance, on_heartbeat=None, correlator=None, on_dr
 
 
 def stop_etw_monitor(session):
-    """Stop the session start_etw_monitor() returned. Safe to call with None
-    (the sensor never started) and never raises.
+    """Stop an ETW session. Safe to call with None.
 
-    Needed because pywintrace's consumer thread is not a daemon and blocks in
-    ProcessTrace() until told to stop, so a process that just falls off the
-    end of main() can't exit - Ctrl+C then needs a second press, which prints
-    a KeyboardInterrupt traceback from threading._shutdown.
-
-    ETW.stop() disables the provider *before* it stops the consumer thread and
-    doesn't guard the first step: if EnableTraceEx2/ControlTrace fails it
-    raises, the consumer is never told to stop, and the hang comes back. So on
-    failure the consumer is stopped directly."""
+    pywintrace's consumer thread is not a daemon and blocks in ProcessTrace()
+    until told to stop - without this call the process cannot exit. ETW.stop()
+    disables the provider first; if that raises, the consumer is stopped directly
+    to avoid the hang."""
     if session is None:
         return
     try:
