@@ -106,18 +106,38 @@ MISS_REASON = {
 # Runner
 # ---------------------------------------------------------------------------
 
-def run_five():
+def run_five(verbose=False):
     """Run all 5 scenarios × 4 configs. Returns list of result dicts."""
+    config_labels = {
+        'all_three':   'All Three',
+        'kernel_only': 'Kernel Only',
+        'sysmon_only': 'Sysmon Only',
+        'etw_only':    'ETW Only',
+    }
     results = []
     for i, scenario in enumerate(FIVE_SCENARIOS):
+        if verbose:
+            print(f"\n{'─' * 60}")
+            print(f"  SCENARIO: {SHORT_LABEL[scenario['id']]}")
+            print(f"  Harness : {scenario['harness']}")
+            print(f"  Exclusive sensor: {EXCLUSIVE[scenario['id']].upper()}")
+            print(f"{'─' * 60}")
         for config_id, active in SENSOR_CONFIGS:
             pid = _BASE_PID + (i * 100) + {'all_three': 1, 'kernel_only': 2,
                                             'sysmon_only': 3, 'etw_only': 4}[config_id]
+            if verbose:
+                active_str = ', '.join(sorted(active))
+                print(f"  [{config_labels[config_id]:<15}]  active sensors: {active_str}")
             r = _run_scenario(scenario, active, pid)
             r['scenario_id']   = scenario['id']
             r['scenario_name'] = scenario['name']
             r['config_id']     = config_id
+            if verbose:
+                status = f"✓  DETECTED  (score={r['score']:.0f})" if r['detected'] else "✗  MISSED"
+                print(f"                      → {status}")
             results.append(r)
+    if verbose:
+        print(f"\n{'─' * 60}\n")
     return results
 
 
@@ -270,11 +290,12 @@ def format_csv(results):
 
 def main():
     p = argparse.ArgumentParser(description='Five-scenario sensor coverage evaluation')
-    p.add_argument('--json', action='store_true', help='Output JSON')
-    p.add_argument('--csv',  action='store_true', help='Output CSV')
+    p.add_argument('--json',    action='store_true', help='Output JSON')
+    p.add_argument('--csv',     action='store_true', help='Output CSV')
+    p.add_argument('--verbose', action='store_true', help='Print live result for each run')
     args = p.parse_args()
 
-    results = run_five()
+    results = run_five(verbose=args.verbose or (not args.json and not args.csv))
 
     if args.json:
         print(format_json(results))
