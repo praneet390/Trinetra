@@ -154,11 +154,6 @@ cd src
 ..\.venv\Scripts\python.exe main.py
 ```
 
-**Ablation / sensor coverage evaluation**
-```powershell
-..\.venv\Scripts\python.exe five_scenario_eval.py
-```
-
 **Failure-injection lab**
 ```powershell
 python failure_lab.py
