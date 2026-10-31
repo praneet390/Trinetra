@@ -11,40 +11,25 @@ Sysmon, raw ETW and a custom kernel driver, fused into one scored engine and tes
 ![Driver](https://img.shields.io/badge/kernel%20driver-WDM-5C2D91)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-[Key features](#key-features) · [Architecture](#architecture) · [Installation](#installation) · [Usage](#usage) · [Evasion matrix](#evasion-matrix) · [Deep dive](docs/internals.md)
-
 </div>
 
 ---
 
-Every Windows telemetry source lies by omission. Sysmon reports only a
-process's *claimed* parent. ETW and a kernel notify routine carry no command
-line. PPL hides some LSASS handle requests even from a kernel driver. This agent
-runs the sensors side by side, fuses them, and records exactly which attacks each
-one misses and whether fusion recovers them.
+Every Windows telemetry source lies by omission. Sysmon reports only a process's *claimed* parent. ETW carries no command line. PPL hides LSASS handle requests from Sysmon entirely. This agent runs all three sensors side by side, fuses them, and records exactly which attacks each one misses and whether fusion recovers them.
 
 ## Key features
 
-* **Three fused sensors**: Sysmon (rich fields), ETW `Kernel-Process` (low latency, no Sysmon needed) and a WDM kernel driver (real process creator, LSASS handle requests, driver loads), correlated by PID.
-* **Sensors that audit each other**: if ETW and Sysmon disagree about a parent PID, it is logged as `[TELEMETRY_CONTRADICTION]` instead of silently resolved.
-* **Per-event tamper detection**: the kernel driver and ETW are two independent witnesses to every process creation. If one reports a creation the other never does, that is logged as `[SENSOR-BLINDSPOT]` within seconds (window plus one GC pass, about 10 s by default), well before the 60-second heartbeat watchdog would notice. Warning-only; it never scores or kills.
-* **Knows when it is blind**: sensor health reduces to `HEALTHY / DEGRADED / PARTIALLY_BLIND / CRITICALLY_BLIND`, and the dashboard qualifies its own "0 alerts" tiles when visibility is reduced.
+* **Three fused sensors**: Sysmon (rich fields), ETW `Kernel-Process` (low latency) and a WDM kernel driver (real process creator, LSASS handle requests, driver loads), correlated by PID.
+* **Sensors that audit each other**: if ETW and Sysmon disagree about a parent PID it is logged as `[TELEMETRY_CONTRADICTION]` instead of silently resolved.
+* **Blind-spot detection**: if the kernel driver and ETW disagree about a process creation within a 5-second window it is logged as `[SENSOR-BLINDSPOT]` — not scored, just flagged.
+* **Knows when it is blind**: sensor health reduces to `HEALTHY / DEGRADED / PARTIALLY_BLIND / CRITICALLY_BLIND`; the dashboard qualifies its own alert tiles accordingly.
 * **Scored response**: per-process score with decay; warning at 50, suspend and terminate at 80, behind a hardcoded protected-process floor.
-* **Self-protecting**: the driver strips terminate and injection rights from handles to the agent, so `taskkill /F` against it fails.
+* **Self-protecting**: the driver strips terminate and injection rights from handles to the agent — `taskkill /F` fails.
 * **Static analysis**: PE structure, import patterns, entropy, imphash threat intel and metamorphic-clone detection. Samples are parsed, never executed.
-* **Active memory sweep**: finds staged DLLs and anonymous RWX (shellcode-shaped) regions, with first-seen dwell time.
-* **Forensic ancestry graph**: captured the first time a PID crosses a threshold and kept after the process dies.
+* **Active memory sweep**: finds staged DLLs and anonymous RWX regions, with first-seen dwell time.
 * **Declarative rules**: drop a YAML file in `rules/custom/`; no code, no `eval`.
-* **Measured, not assumed**: a [live-tested evasion matrix](reports/evasion_matrix.md) and a failure-injection lab that found four real bugs.
 
 ## Architecture
-
-The agent works in four phases:
-
-1. **Collect**: Sysmon, ETW and the kernel driver each feed a bounded queue and a separate scoring thread, so a slow rule can never stall event delivery. The static scanner and a 30-second module sweep run alongside.
-2. **Correlate**: `ProcessCorrelator` merges ETW and Sysmon events for the same PID: ETW first as *provisional*, then *fused* with Sysmon's richer fields. Kernel events are dispatched independently and deduplicated per PID. A watchdog tracks every sensor's heartbeat and dropped events, and a witness check compares the kernel driver's and ETW's reports of each process creation (see [Witness-gap detection](docs/internals.md#witness-gap-detection-per-event-sensor-tamper-detection)).
-3. **Score**: every finding adds points through one choke point that enforces the protected-process floor, decay and PID-reuse guard. YAML rules score through the same path.
-4. **Respond and surface**: crossing a threshold triggers a forensic snapshot, and at 80 a suspend then terminate. Everything is shown on a local dashboard.
 
 ```mermaid
 flowchart LR
@@ -58,7 +43,6 @@ flowchart LR
     H{{Heuristic engine<br/>score + decay}} -->|≥ 50| W[Warning +<br/>forensic snapshot]
     H -->|≥ 80| X[Suspend +<br/>terminate]
     H --> D[Dashboard]
-    W --> D
     HW[Sensor health<br/>watchdog] -.-> H
 ```
 
@@ -69,13 +53,11 @@ flowchart LR
 | Command line | ✅ | ❌ | ❌ |
 | Parent image path | ✅ | ❌ | ❌ |
 | Claimed parent PID | ✅ | ✅ | ✅ |
-| **Real** creator PID | ❌ | ⚠️ ² | ✅ |
-| LSASS handle requests | ✅ ¹ | ❌ | ✅ ¹ |
+| **Real** creator PID | ❌ | ⚠️ | ✅ |
+| LSASS handle requests (pre-PPL) | ❌ | ❌ | ✅ |
 | Kernel driver loads | ❌ | ❌ | ✅ |
-| Needs Sysmon installed | yes | no | no |
 
-¹ Neither sees a non-elevated `OpenProcess` on LSASS: PPL rejects it before any callback runs.
-² ETW's event header carries the creating process (Fibratus and Velociraptor both use it). This agent now reads it and cross-checks it against the driver, but **scoring on it is off by default** until you have confirmed on your host that it matches the driver's real creator (see [Usage](#usage), step 7). Not yet verified live; see the [comparison notes](docs/comparison.md#5-correction-to-this-projects-own-matrix).
+ETW's event header carries the creating process and is read and cross-checked against the driver, but scoring on it is off by default until verified per-host.
 
 ### Detections
 
@@ -90,141 +72,19 @@ flowchart LR
 | Obfuscated / download-execute PowerShell | 45 | T1059.001 |
 | Run-key persistence | 40 | T1547.001 |
 | Execution from staging directory | 30 | T1036 |
-| Kernel driver loaded | 20 | n/a |
+| Kernel driver loaded | 20 | — |
 | Injected module / anonymous RWX region | 35–60 | T1055 |
-| Static PE findings (RWX, entropy, injection / LSASS-dump / AMSI / ETW-patch IAT, imphash match, ...) | 25–70 | various |
-
-Sigma and YARA equivalents are in [`rules/`](rules/). A positively identified
-Cobalt Strike stager is tagged `[HANDS-ON THREAT]` and pinned to the top of the
-dashboard.
+| Static PE findings | 25–70 | various |
 
 ### Safety
 
-The agent can kill processes. Two real incidents shaped it: a ransomware rule that
-killed an IDE twice, and a false positive that suspended `csrss.exe` and froze the OS.
+The agent can kill processes. Two real incidents shaped it: a ransomware rule that killed an IDE twice, and a false positive that suspended `csrss.exe` and froze the OS.
 
-* **Protected floor**: core OS processes, PIDs 0 and 4, and the agent itself can never be scored or mitigated. Enforced in scoring and again in `mitigate()`, and ported into the driver.
-* **Hardcoded constants**: the protected list, access masks and tamper patterns cannot be loosened from the config file.
-* **Scoped rules**: command-line rules only inspect processes that execute such commands; the ransomware rule covers user document folders and excludes dev tools.
+* **Protected floor**: core OS processes, PIDs 0 and 4, and the agent itself can never be scored or mitigated — enforced in scoring, `mitigate()`, and the driver.
+* **Hardcoded constants**: the protected list, access masks and tamper patterns cannot be loosened from config.
 * **Trusted-broker discount**: Windows' own COM and app brokers legitimately reparent children. This fixed a false positive that killed a live Outlook.
 
-To observe without any kill risk, comment out `self.mitigate(pid)` in
-`HeuristicEngine._check_threshold()`.
-
-## Installation
-
-> Windows 10/11 x64, Python 3.11+, run **elevated**. Use a disposable VM if you build the driver.
-
-1. **Clone and install dependencies**
-   ```powershell
-   git clone https://github.com/praneet390/Entity_2.0
-   cd Entity_2.0
-   python -m venv .venv
-   .venv\Scripts\pip install pefile psutil pywin32 pyyaml pywintrace
-   ```
-
-2. **Install Sysmon** (the binaries are not in the repo)
-   ```powershell
-   Invoke-WebRequest -Uri "https://download.sysinternals.com/files/Sysmon.zip" -OutFile Sysmon.zip
-   Expand-Archive Sysmon.zip -DestinationPath tools\sysmon -Force
-   cd tools\sysmon; .\Sysmon64.exe -accepteula -i config.xml
-   ```
-
-3. **Install the kernel driver** *(optional; without it the agent runs on Sysmon and ETW)*
-
-   Run the installer script **once** on each new machine (elevated PowerShell):
-   ```powershell
-   scripts\install_driver.ps1
-   ```
-   The script handles everything in one shot:
-   - Builds `sensor.sys` via MSBuild if it is not already built (requires VS 2022 + WDK)
-   - Creates a self-signed code-signing certificate and trusts it in the machine stores
-   - Signs `sensor.sys`
-   - Enables test-signing mode (`bcdedit /set testsigning on`)
-   - Creates and starts the `sensor` kernel-driver Windows service
-
-   If test signing was not already on, the script tells you to reboot once.
-   After that reboot (or if test signing was already on) the agent starts the
-   service itself on every subsequent launch via `ensure_driver_running()` in
-   `kernel_sensor.py` — no further manual steps.
-
-   > **Note:** test-signing mode is required for the self-signed certificate.
-   > Use a disposable or dedicated VM; do not enable it on a production machine.
-
-4. **Optional threat intel**: metadata only (imphash, family, tags) from [MalwareBazaar](https://bazaar.abuse.ch); sample binaries are never downloaded.
-   ```powershell
-   $env:MALWAREBAZAAR_AUTH_KEY = "..."   # free key from auth.abuse.ch; never commit it
-   python tools\threat_intel_sync.py --recent 100
-   ```
-
-## Usage
-
-1. **Dashboard** (self-elevates via UAC, loopback only)
-   ```powershell
-   cd src
-   ..\.venv\Scripts\python.exe web_server.py      # http://127.0.0.1:8787
-   ```
-   Tabs: Detections, Endpoint Processes (Live status, ancestry Chain, Terminate), Static Analysis, Process Explorer, Rules, plus a visibility badge.
-
-2. **Headless agent**
-   ```powershell
-   ..\.venv\Scripts\python.exe main.py
-   ```
-
-3. **Failure-injection lab**: breaks the telemetry pipeline on purpose and checks detection, fallback and recovery. Software-only, safe anywhere.
-   ```powershell
-   python failure_lab.py                # all scenarios
-   python failure_lab.py --list
-   ```
-
-4. **Live VM evaluation**: harmless technique emulations plus a benign corpus, scored against the running agent. **Disposable VM only.**
-   ```powershell
-   python vm_eval.py --vm
-   ```
-
-5. **Attack harnesses**: the programs in `driver/sensor/*_test.c` behind the evasion matrix. Documented Win32 APIs only, nothing destructive.
-   ```
-   cl.exe /nologo /W4 /EHsc ppid_spoof_test.c /link /OUT:ppid_spoof_test.exe
-   ```
-
-6. **Tests**
-   ```powershell
-   python -m pytest
-   ```
-
-7. **Verify the cross-sensor checks on your host** (agent running, driver loaded):
-   ```powershell
-   # after some normal activity: the ETW header creator should match the driver's real creator
-   (Invoke-RestMethod http://127.0.0.1:8787/api/summary).witness
-   #   creator_agreement.disagree should be ~0 before you set correlator.etw_creator_scoring: true
-
-   # blind ETW on purpose, then start any program
-   logman query -ets                      # find the GUID-named session the agent created
-   logman stop "<that-guid>" -ets
-   notepad.exe                            # within ~10 s: "[SENSOR-BLINDSPOT] ETW did not report ..."
-   ```
-   Restart the agent to restore ETW. Do this in a VM.
-
-Each sensor can fail to start independently; the rest keep working.
-
-## Configuration
-
-* **Tunables** (decay, thresholds, ransomware window, correlator fuse window, self-test interval) live in [`config/detection.yml`](config/detection.yml). A missing file falls back to the built-in defaults. The correlator section also controls `witness_check` (on), `witness_window_seconds` (5) and `etw_creator_scoring` (off).
-* **Custom rules**: any YAML file in `rules/custom/`, picked up on the next start:
-  ```yaml
-  id: custom_lolbin_from_appdata_roaming
-  applies_to: process_create   # process_create | process_access | file_create | registry_event | static_pe
-  technique: T1218
-  score: 35
-  match:
-    all:
-      - { field: image, op: contains, value: "\\appdata\\roaming\\" }
-      - { field: image, op: contains, value: [rundll32.exe, regsvr32.exe, mshta.exe] }
-  message: "LOLBin '{image}' launched from AppData\\Roaming"
-  ```
-  Operators: `equals`, `contains`, `in`, `not_in`, `regex`, `gt`, `lt`. Rules score through the same engine, so the safety floor applies to them too.
-* **Known-good allowlist**: SHA-256 hashes in `data/known_good_hashes.json` suppress static findings for vetted files.
-* **Static features** come from `tools/extract_features.py`, which parses PE bytes and never executes a sample.
+To observe without any kill risk, comment out `self.mitigate(pid)` in `HeuristicEngine._check_threshold()`.
 
 ## Sensor ablation study
 
@@ -243,45 +103,94 @@ Tested live on **Windows 11 build 26100** (`attack_run_20261031_223251`).
 **Every ❌ is a structural guarantee, not a tuning gap:**
 
 - **Sysmon misses PPID spoof and LSASS** — EventID 1 has no `CreatingThreadId`; PPL rejects `OpenProcess` before EventID 10 can fire.
-- **Kernel misses Defender tamper and Office LOLBin** — `PsSetCreateProcessNotifyRoutineEx` carries no `CommandLine` or `ParentImage`; both are hardcoded `None` in the dispatch path.
-- **ETW misses everything** — `Microsoft-Windows-Kernel-Process` (`{22fb2cd6}`) exposes five fields at `ProcessStart`: PID, CreateTime, ParentPID, SessionID, ImageName. `CommandLine` and `ParentImage` do not exist in the provider manifest. **35 live events captured on the test host: every single one had `CommandLine: null` and `ParentImage: null`.** This is a permanent Windows API constraint.
+- **Kernel misses Defender tamper and Office LOLBin** — `PsSetCreateProcessNotifyRoutineEx` carries no `CommandLine` or `ParentImage`; both are `None` on the kernel dispatch path.
+- **ETW misses everything** — `Microsoft-Windows-Kernel-Process` (`{22fb2cd6}`) exposes five fields at `ProcessStart`: PID, CreateTime, ParentPID, SessionID, ImageName. `CommandLine` and `ParentImage` are absent from the provider manifest. **35 live events captured on the test host — every one had `CommandLine: null` and `ParentImage: null`.** This is a permanent Windows API constraint, not a configuration gap.
 
 No individual sensor exceeds 3/5 coverage. Fusion is the only configuration that reaches 5/5.
 
-Reproduce locally:
+## Installation
+
+> Windows 10/11 x64, Python 3.11+, run **elevated**. Use a disposable VM.
+
+1. **Clone and install dependencies**
+   ```powershell
+   git clone https://github.com/praneet390/Entity_2.0
+   cd Entity_2.0
+   python -m venv .venv
+   .venv\Scripts\pip install pefile psutil pywin32 pyyaml pywintrace
+   ```
+
+2. **Install Sysmon**
+   ```powershell
+   Invoke-WebRequest -Uri "https://download.sysinternals.com/files/Sysmon.zip" -OutFile Sysmon.zip
+   Expand-Archive Sysmon.zip -DestinationPath tools\sysmon -Force
+   cd tools\sysmon; .\Sysmon64.exe -accepteula -i config.xml
+   ```
+
+3. **Install the kernel driver** *(optional — without it the agent runs on Sysmon and ETW only)*
+
+   Requires VS 2022 + WDK, test-signing mode enabled (`bcdedit /set testsigning on`), and a reboot. The agent starts the driver service automatically on each launch via `ensure_driver_running()`.
+
+4. **Optional threat intel** — metadata only from [MalwareBazaar](https://bazaar.abuse.ch); binaries are never downloaded.
+   ```powershell
+   $env:MALWAREBAZAAR_AUTH_KEY = "..."
+   python tools\threat_intel_sync.py --recent 100
+   ```
+
+## Usage
+
+**Dashboard**
 ```powershell
 cd src
-..\.venv\Scripts\python.exe .\five_scenario_eval.py
+..\.venv\Scripts\python.exe web_server.py      # http://127.0.0.1:8787
 ```
 
-## Evasion matrix
+**Headless agent**
+```powershell
+..\.venv\Scripts\python.exe main.py
+```
 
-Live-tested on a running agent with all three sensors up
-([full report](reports/evasion_matrix.md)):
+**Ablation / sensor coverage evaluation**
+```powershell
+..\.venv\Scripts\python.exe five_scenario_eval.py
+```
 
-| Technique | Sysmon | ETW | Kernel | Result |
-|---|:-:|:-:|:-:|---|
-| PPID spoof, untrusted creator | ❌ | ❌ ³ | ✅ | +80, caught only by the driver |
-| PPID spoof, trusted System32 broker | ❌ | ❌ ³ | ✅ | +20, logged but not killed |
-| `OpenProcess(VM_READ)` on LSASS, non-elevated | ❌ | n/a | ❌ | **nothing sees it** (PPL) |
-| Defender tamper command line | ✅ | ❌ | ❌ | +90, needs Sysmon |
-| Office → LOLBin | ✅ | ❌ | ❌ | +60, needs Sysmon |
+**Failure-injection lab**
+```powershell
+python failure_lab.py
+```
 
-³ Recorded before the agent read the creating PID from the ETW event header, which ETW provides. It is read and cross-checked now, but scoring on it is off by default and the matrix has not been re-run with it.
+**Tests**
+```powershell
+python -m pytest
+```
 
-The "Sysmon stopped" cells for the last two rows were not run live. The matrix
-also records two scoring and fusion bugs it exposed and fixed.
+## Configuration
+
+Tunables live in [`config/detection.yml`](config/detection.yml). A missing file falls back to built-in defaults.
+
+**Custom rules** — drop a YAML file in `rules/custom/`:
+```yaml
+id: custom_lolbin_from_appdata_roaming
+applies_to: process_create
+technique: T1218
+score: 35
+match:
+  all:
+    - { field: image, op: contains, value: "\\appdata\\roaming\\" }
+    - { field: image, op: contains, value: [rundll32.exe, regsvr32.exe, mshta.exe] }
+message: "LOLBin '{image}' launched from AppData\\Roaming"
+```
 
 ## Project layout
 
 ```
-src/        agent, sensors, engine, dashboard server + tests
-  webapp/   dashboard frontend (HTML / CSS / JS)
-driver/     sensor.c kernel driver + attack/test harnesses
-rules/      sigma.yml, static.yar, family_signatures.yar, custom/*.yml
+src/        agent, sensors, engine, dashboard server
+  webapp/   dashboard frontend
+driver/     sensor.c kernel driver
+rules/      sigma.yml, static.yar, custom/*.yml
 config/     detection.yml
 tools/      extract_features.py, threat_intel_sync.py, sysmon/config.xml
 data/       binaries.json, known_imphashes.json
-reports/    malware write-ups, evasion_matrix.md
-docs/       internals.md (design notes), comparison.md (sourced comparison)
+reports/    evasion_matrix.md
 ```
