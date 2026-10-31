@@ -129,7 +129,11 @@ No individual sensor exceeds 3/5 coverage. Fusion is the only configuration that
 
 3. **Install the kernel driver** *(optional — without it the agent runs on Sysmon and ETW only)*
 
-   Requires VS 2022 + WDK, test-signing mode enabled (`bcdedit /set testsigning on`), and a reboot. The agent starts the driver service automatically on each launch via `ensure_driver_running()`.
+   The pre-built driver and certificate are included. Run once as Administrator, reboot once:
+   ```bat
+   install.bat
+   ```
+   After the reboot the agent starts the driver service automatically on every launch.
 
 4. **Optional threat intel** — metadata only from [MalwareBazaar](https://bazaar.abuse.ch); binaries are never downloaded.
    ```powershell
