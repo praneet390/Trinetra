@@ -22,6 +22,7 @@ Scenarios selected to maximise coverage-gap visibility:
 
 import argparse
 import json
+import logging
 import sys
 import os
 
@@ -128,7 +129,12 @@ def run_five(verbose=False):
             if verbose:
                 active_str = ', '.join(sorted(active))
                 print(f"  [{config_labels[config_id]:<15}]  active sensors: {active_str}")
+                logging.disable(logging.NOTSET)
+                logging.basicConfig(level=logging.INFO, format='    LOG | %(message)s', force=True)
+            else:
+                logging.disable(logging.CRITICAL)
             r = _run_scenario(scenario, active, pid)
+            logging.disable(logging.CRITICAL)
             r['scenario_id']   = scenario['id']
             r['scenario_name'] = scenario['name']
             r['config_id']     = config_id
