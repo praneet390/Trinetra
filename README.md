@@ -226,6 +226,34 @@ Each sensor can fail to start independently; the rest keep working.
 * **Known-good allowlist**: SHA-256 hashes in `data/known_good_hashes.json` suppress static findings for vetted files.
 * **Static features** come from `tools/extract_features.py`, which parses PE bytes and never executes a sample.
 
+## Sensor ablation study
+
+Five attack scenarios run against each sensor configuration in isolation, then fused.
+Tested live on **Windows 11 build 26100** (`attack_run_20261031_223251`).
+
+| Scenario | MITRE | All Three | Kernel only | Sysmon only | ETW only |
+|---|---|:-:|:-:|:-:|:-:|
+| PPID Spoof | T1134.004 | ✅ (80) | ✅ (80) | ❌ | ❌ |
+| LSASS Access (pre-PPL) | T1003.001 | ✅ (70) | ✅ (70) | ❌ | ❌ |
+| Kernel Driver Load | — | ✅ (20) | ✅ (20) | ❌ | ❌ |
+| Defender Tamper | T1562.001 | ✅ (90) | ❌ | ✅ (90) | ❌ |
+| Office LOLBin | T1204.002 | ✅ (60) | ❌ | ✅ (60) | ❌ |
+| **Coverage** | | **5 / 5** | **3 / 5** | **2 / 5** | **0 / 5** |
+
+**Every ❌ is a structural guarantee, not a tuning gap:**
+
+- **Sysmon misses PPID spoof and LSASS** — EventID 1 has no `CreatingThreadId`; PPL rejects `OpenProcess` before EventID 10 can fire.
+- **Kernel misses Defender tamper and Office LOLBin** — `PsSetCreateProcessNotifyRoutineEx` carries no `CommandLine` or `ParentImage`; both are hardcoded `None` in the dispatch path.
+- **ETW misses everything** — `Microsoft-Windows-Kernel-Process` (`{22fb2cd6}`) exposes five fields at `ProcessStart`: PID, CreateTime, ParentPID, SessionID, ImageName. `CommandLine` and `ParentImage` do not exist in the provider manifest. **35 live events captured on the test host: every single one had `CommandLine: null` and `ParentImage: null`.** This is a permanent Windows API constraint.
+
+No individual sensor exceeds 3/5 coverage. Fusion is the only configuration that reaches 5/5.
+
+Reproduce locally:
+```powershell
+cd src
+..\.venv\Scripts\python.exe .\five_scenario_eval.py
+```
+
 ## Evasion matrix
 
 Live-tested on a running agent with all three sensors up
