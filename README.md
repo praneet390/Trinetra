@@ -4,20 +4,23 @@
 
 **त्रिनेत्र · The Three-Eyed**
 
-*A Windows EDR built on the one insight most tools miss: no single telemetry source sees the full picture.*
+*In Hindu mythology, Shiva's third eye perceives what the other two cannot — it sees through illusion, burns what is hidden. The name fits.*
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D4)
 ![Python](https://img.shields.io/badge/python-3.11%2B-3776AB)
 ![Driver](https://img.shields.io/badge/kernel%20driver-WDM-5C2D91)
+![Tested](https://img.shields.io/badge/tested-Windows%2011%20build%2026100-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 </div>
 
 ---
 
-Every Windows telemetry source lies by omission. Sysmon sees rich process fields but cannot verify a process’s claimed parent. ETW’s `Kernel-Process` provider (`{22fb2cd6}`) carries no `CommandLine` or `ParentImage` — a permanent API constraint confirmed across 35 live captures on Windows 11 build 26100, every one `null`. The kernel sees ground truth the other two cannot, but has no command line. No individual sensor covers more than 3 of 5 attack scenarios in ablation testing. **Fusion is the only configuration that reaches 5/5.**
+`PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`. A process launches, claims Explorer as its parent, and Sysmon's EventID 1 logs it exactly that way — no flag, no caveat, no alert. ETW's `Kernel-Process` provider ships no `CommandLine` or `ParentImage` at all — a permanent gap in the provider manifest, confirmed across 35 live captures on Windows 11 build 26100, every one `null`. The kernel driver reads the real creator PID. Two sensors missed it. One caught it.
 
-Trinetra instruments all three simultaneously, fuses them through a correlated scoring engine, and knows when it is being blinded.
+No single sensor covers more than 3 of 5 attack scenarios in ablation testing. **Fusion is the only configuration that reaches 5/5.**
+
+Trinetra fuses Sysmon, raw ETW kernel telemetry, and a custom WDM kernel driver in real time. It raises an alert when any two sensors contradict each other — and another when one goes silent.
 
 ---
 
@@ -38,7 +41,7 @@ flowchart LR
     HW[SensorHealth<br/>HEALTHY → CRITICALLY_BLIND] -.->|caveat banner| D
 ```
 
-Each sensor operates independently. One going dark degrades the configuration — it does not halt detection.
+`ProcessCorrelator` is the fusion layer: every event is matched by PID within a 2-second window, claimed parent PIDs are cross-checked between all three sensors, and any discrepancy that survives deduplication surfaces as a named alert. Each sensor operates independently — one going dark degrades the configuration; it does not halt detection.
 
 ---
 
@@ -53,6 +56,8 @@ Each sensor operates independently. One going dark degrades the configuration �
 | LSASS handle requests | ❌ PPL blocks | ❌ | ✅ pre-operation |
 | Kernel driver loads | ❌ | ❌ | ✅ real-time |
 | Cross-sensor contradiction | — | — | ✅ |
+
+> ⚠️  ETW's `EventHeader.ProcessId` carries the creating process — event delivery metadata, not a declared manifest field. A process that tunnels events through a surrogate can spoof this value. The kernel driver's `PsSetCreateProcessNotifyRoutineEx` callback is immune.
 
 The ETW and Sysmon blind spots are structural — no configuration change closes them. The kernel driver closes both, while Sysmon provides the command-line visibility the kernel lacks. Fusion is the only complete picture.
 
@@ -79,27 +84,23 @@ Each ❌ is a structural guarantee:
 
 ---
 
-## Key capabilities
+## Capabilities
 
-- **Kernel-verified PPID detection** — `PsSetCreateProcessNotifyRoutineEx` reads the real creator PID that `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` cannot influence. Sysmon and ETW only see the spoofed claim.
+**Kernel-verified PPID detection** — A process can claim any parent via `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`. Sysmon and ETW log the claim. The kernel driver reads the real creator PID from `PsSetCreateProcessNotifyRoutineEx`, which cannot be spoofed.
 
-- **Pre-operation LSASS access detection** — `ObRegisterCallbacks` on `PsProcessType` fires before the handle is granted, observing credential-access attempts that Sysmon cannot see.
+**Pre-operation LSASS interception** — PPL blocks Sysmon's EventID 10 before it fires against `lsass.exe`. `ObRegisterCallbacks` runs at the pre-operation stage — before the handle is granted, before PPL can close the observer out. Confirmed across three test runs.
 
-- **Cross-sensor contradiction detection** — when ETW and Sysmon report the same process but disagree on the parent PID, a `[TELEMETRY_CONTRADICTION]` alert fires. Never silently resolved.
+**Cross-sensor contradiction detection** — When ETW and Sysmon report the same process but disagree on the parent PID, a `[TELEMETRY_CONTRADICTION]` alert fires. Never silently resolved.
 
-- **Per-event sensor blindspot detection** — if the kernel driver and ETW disagree on whether a process was created within a 5-second window, a `[SENSOR-BLINDSPOT]` alert fires. Detects ETW session tampering per event, not on a 60-second heartbeat.
+**Per-event sensor blindspot detection** — If the kernel driver and ETW disagree on whether a process was created within a 5-second window, a `[SENSOR-BLINDSPOT]` alert fires. Detects ETW session tampering per event, not on a 60-second heartbeat.
 
-- **Driver-level self-protection** — `ObRegisterCallbacks` strips `PROCESS_TERMINATE`, `PROCESS_VM_WRITE`, and `PROCESS_CREATE_THREAD` from any external handle opened to the agent. `taskkill /F` and injection attempts fail at the kernel.
+**Driver-level self-protection** — `ObRegisterCallbacks` strips `PROCESS_TERMINATE`, `PROCESS_VM_WRITE`, and `PROCESS_CREATE_THREAD` from any external handle opened against the agent process. `taskkill /F` fails at the kernel.
 
-- **Sensor health state machine** — `HEALTHY / DEGRADED / PARTIALLY_BLIND / CRITICALLY_BLIND`. The dashboard qualifies its own “0 alerts” tiles when visibility is reduced — it never silently lies about what it can see.
+**Scored, decaying threat model** — Per-process cumulative score with time-decay (~20 pts/min). Forensic snapshot at 50, suspend + terminate at 80. Trusted-path discounts apply — a PPID spoof from a known COM broker scores 20 instead of 80; an LSASS access from System32 scores 30 instead of 70. These resolved live false positives against Outlook and VS Code before shipping.
 
-- **Scored, decaying threat model** — per-process cumulative score with time-based decay (~20 pts/min). Forensic snapshot at 50, suspend + terminate at 80.
+**Static PE analysis + live memory sweep** — Section entropy, RWX segments, import hash, IAT injection primitives, parsed from bytes, never executed. Parallel 30-second module sweep: anonymous RWX regions, staging-path DLLs, true dwell-time tracking.
 
-- **Static PE analysis** — section entropy, RWX segments, import hash, injection IAT patterns, LSASS dump primitives, C2 string indicators. Parsed from bytes, never executed.
-
-- **Live memory sweep** — anonymous RWX regions, staging-path injected modules, true dwell-time tracking. Runs every 30 seconds.
-
-- **Declarative custom rules** — YAML drop-in to `rules/custom/`; scores through the same engine path as built-in detections, safety floor included.
+**Sensor health state machine** — `HEALTHY / DEGRADED / PARTIALLY_BLIND / CRITICALLY_BLIND`. The dashboard qualifies its own "0 alerts" tiles when visibility is reduced — it never silently lies about what it can see.
 
 ---
 
@@ -119,8 +120,6 @@ Each ❌ is a structural guarantee:
 | Kernel-mode driver loaded | 20 | — |
 | Injected module / anonymous RWX region | 35–60 | T1055 |
 | Static PE findings | 25–70 | various |
-
-Trusted-path discounts apply — a PPID spoof from a known COM broker scores 20 instead of 80; an LSASS access from a System32 binary scores 30 instead of 70. These resolved live false positives against Outlook and VS Code before shipping.
 
 ---
 
