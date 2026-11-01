@@ -20,7 +20,14 @@
 
 Every Windows monitoring approach has gaps it cannot close on its own. Sysmon can be made to record the wrong parent process. ETW's kernel telemetry carries no command-line data — by design, regardless of configuration. Neither can intercept credential-access attempts against protected system processes before they happen. Attackers who understand these constraints can craft techniques that walk through any single-sensor deployment undetected.
 
-Trinetra's answer is correlation: run all three simultaneously, cross-check every event, and treat sensor disagreement as a detection in its own right. When ETW and Sysmon report the same process but claim different parents, a `[TELEMETRY_CONTRADICTION]` alert fires. When the kernel driver witnesses a process the ETW session never reported, that's a `[SENSOR-BLINDSPOT]`. The tool also tracks its own visibility — a four-state health model qualifies every dashboard tile when a sensor degrades, so a quiet console genuinely means quiet, not blind.
+Trinetra's answer is correlation: run all three simultaneously, cross-check every event, and treat sensor disagreement as a detection in its own right. When ETW and Sysmon report the same process but claim different parents, a `[TELEMETRY_CONTRADICTION]` alert fires. When the kernel driver witnesses a process that ETW never reported, that's a `[SENSOR-BLINDSPOT]`. The tool also knows when it is being degraded — a four-state health model qualifies every dashboard tile when a sensor goes dark, so a quiet console genuinely means quiet, not blind.
+
+A few things that set it apart beyond the three-sensor approach:
+
+- **Sensor disagreement is a first-class detection primitive.** Most EDRs treat each sensor's output in isolation. Trinetra's correlation layer is designed specifically to find the gap *between* what sensors report — the contradiction itself is the signal.
+- **The kernel driver protects the agent.** External handles to the Trinetra process are stripped of terminate, inject, and VM-write rights at the kernel level. `taskkill /F` and injection attempts fail before they land — a Python-based EDR that can be killed with one command is not an EDR.
+- **Mitigation is always preceded by forensic capture.** Before any process is suspended or terminated, the full ancestry chain is snapshotted. You have the evidence before the process is gone.
+- **The tool publishes its own blind spots.** Rather than silently degrading, Trinetra explicitly tracks which attack classes it can and cannot see given the current sensor configuration, and surfaces that in the dashboard.
 
 In ablation testing on Windows 11 build 26100, no individual sensor detected more than 3 of 5 attack scenarios. **All three fused: 5/5.** The gaps are structural — not a configuration problem, not a tuning problem. Fusion is the only configuration that reaches full coverage.
 
