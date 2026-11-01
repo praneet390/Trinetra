@@ -16,11 +16,13 @@
 
 ---
 
-`PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`. A process launches, claims Explorer as its parent, and Sysmon's EventID 1 logs it exactly that way — no flag, no caveat, no alert. ETW's `Kernel-Process` provider ships no `CommandLine` or `ParentImage` at all — a permanent gap in the provider manifest, confirmed across 35 live captures on Windows 11 build 26100, every one `null`. The kernel driver reads the real creator PID. Two sensors missed it. One caught it.
+**Trinetra is an open-source Windows EDR that monitors endpoint activity through three independent sensors — Sysmon, kernel ETW, and a custom kernel-mode driver — and fuses their output to detect threats that any single sensor misses.**
 
-No single sensor covers more than 3 of 5 attack scenarios in ablation testing. **Fusion is the only configuration that reaches 5/5.**
+Every Windows monitoring approach has gaps it cannot close on its own. Sysmon can be made to record the wrong parent process. ETW's kernel telemetry carries no command-line data — by design, regardless of configuration. Neither can intercept credential-access attempts against protected system processes before they happen. Attackers who understand these constraints can craft techniques that walk through any single-sensor deployment undetected.
 
-Trinetra fuses Sysmon, raw ETW kernel telemetry, and a custom WDM kernel driver in real time. It raises an alert when any two sensors contradict each other — and another when one goes silent.
+Trinetra's answer is correlation: run all three simultaneously, cross-check every event, and treat sensor disagreement as a detection in its own right. When ETW and Sysmon report the same process but claim different parents, a `[TELEMETRY_CONTRADICTION]` alert fires. When the kernel driver witnesses a process the ETW session never reported, that's a `[SENSOR-BLINDSPOT]`. The tool also tracks its own visibility — a four-state health model qualifies every dashboard tile when a sensor degrades, so a quiet console genuinely means quiet, not blind.
+
+In ablation testing on Windows 11 build 26100, no individual sensor detected more than 3 of 5 attack scenarios. **All three fused: 5/5.** The gaps are structural — not a configuration problem, not a tuning problem. Fusion is the only configuration that reaches full coverage.
 
 ---
 
