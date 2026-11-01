@@ -2,9 +2,9 @@
 
 # Windows Defensive Agent
 
-**A multi-sensor Windows EDR that measures what it can't see.**
+**A multi-sensor Windows EDR with provable sensor fusion — built to close the gaps attackers depend on.**
 
-Sysmon, raw ETW and a custom kernel driver, fused into one scored engine and tested against their own failure modes.
+Sysmon, raw ETW and a custom WDM kernel driver, fused into one scored detection engine and ablation-tested against their own structural blind spots.
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D4)
 ![Python](https://img.shields.io/badge/python-3.11%2B-3776AB)
@@ -15,19 +15,19 @@ Sysmon, raw ETW and a custom kernel driver, fused into one scored engine and tes
 
 ---
 
-Every Windows telemetry source lies by omission. Sysmon reports only a process's *claimed* parent. ETW carries no command line. PPL hides LSASS handle requests from Sysmon entirely. This agent runs all three sensors side by side, fuses them, and records exactly which attacks each one misses and whether fusion recovers them.
+Every Windows telemetry source lies by omission. Sysmon reports only a process's *claimed* parent — `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` spoofs it silently. ETW's `Kernel-Process` provider carries no `CommandLine` or `ParentImage` — a permanent API constraint, not a config gap. PPL blocks Sysmon EventID 10 on LSASS before the callback fires. This agent instruments all three planes simultaneously, fuses them through a correlated scoring engine, and quantifies exactly which TTP classes each sensor cannot observe — and proves fusion closes every gap.
 
 ## Key features
 
-* **Three fused sensors**: Sysmon (rich fields), ETW `Kernel-Process` (low latency) and a WDM kernel driver (real process creator, LSASS handle requests, driver loads), correlated by PID.
-* **Sensors that audit each other**: if ETW and Sysmon disagree about a parent PID it is logged as `[TELEMETRY_CONTRADICTION]` instead of silently resolved.
-* **Blind-spot detection**: if the kernel driver and ETW disagree about a process creation within a 5-second window it is logged as `[SENSOR-BLINDSPOT]` — not scored, just flagged.
-* **Knows when it is blind**: sensor health reduces to `HEALTHY / DEGRADED / PARTIALLY_BLIND / CRITICALLY_BLIND`; the dashboard qualifies its own alert tiles accordingly.
-* **Scored response**: per-process score with decay; warning at 50, suspend and terminate at 80, behind a hardcoded protected-process floor.
-* **Self-protecting**: the driver strips terminate and injection rights from handles to the agent — `taskkill /F` fails.
-* **Static analysis**: PE structure, import patterns, entropy, imphash threat intel and metamorphic-clone detection. Samples are parsed, never executed.
-* **Active memory sweep**: finds staged DLLs and anonymous RWX regions, with first-seen dwell time.
-* **Declarative rules**: drop a YAML file in `rules/custom/`; no code, no `eval`.
+* **Tri-sensor fusion**: Sysmon (rich userspace fields), ETW `Microsoft-Windows-Kernel-Process` (low-latency process telemetry) and a WDM kernel driver (`PsSetCreateProcessNotifyRoutineEx` + `ObRegisterCallbacks`), correlated per-PID through a fused dispatch pipeline.
+* **Cross-sensor contradiction detection**: ETW and Sysmon creator PIDs are compared on every process creation — a mismatch is logged as `[TELEMETRY_CONTRADICTION]`, not silently resolved.
+* **Per-event blind-spot detection**: if the kernel driver and ETW disagree on a process creation within a 5-second witness window, it surfaces as `[SENSOR-BLINDSPOT]` — early warning of sensor tampering or ETW session hijack.
+* **Sensor health telemetry**: real-time state machine — `HEALTHY / DEGRADED / PARTIALLY_BLIND / CRITICALLY_BLIND` — with the dashboard qualifying its own "0 alerts" tiles when visibility is reduced. The EDR knows when it is being blinded.
+* **Scored, decaying threat model**: per-process cumulative score with time-based decay; forensic snapshot at 50, suspend + terminate at 80, behind a hardcoded protected-process floor that cannot be overridden from config.
+* **Driver-level self-protection**: `ObRegisterCallbacks` strips `PROCESS_TERMINATE` and `PROCESS_VM_WRITE` from any handle opened to the agent process — `taskkill /F` and injection both fail at the kernel.
+* **Static PE analysis**: section entropy, import hash, RWX segments, AMSI/ETW-patch IAT patterns, metamorphic-clone detection. Parsed from bytes, never executed.
+* **Live memory sweep**: anonymous RWX regions (shellcode-shaped), injected modules and staged DLLs, with first-seen dwell time — runs every 30 seconds.
+* **Declarative detection rules**: YAML drop-in to `rules/custom/`; scores through the same engine path as built-in detections, safety floor included.
 
 ## Architecture
 
