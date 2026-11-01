@@ -2,8 +2,6 @@
 
 # Trinetra
 
-**त्रिनेत्र · The Three-Eyed**
-
 *A Windows EDR that instruments the kernel, ETW, and Sysmon simultaneously — then proves, by ablation, that no single sensor is sufficient.*
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D4)
