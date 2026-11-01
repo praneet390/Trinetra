@@ -2,8 +2,6 @@
 
 <img src="assets/banner.svg" alt="Trinetra — Three-Sensor Windows EDR" width="100%"/>
 
-*In Hindu mythology, Shiva's third eye perceives what the other two cannot — it sees through illusion, burns what is hidden. The name fits.*
-
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D4)
 ![Python](https://img.shields.io/badge/python-3.11%2B-3776AB)
 ![Driver](https://img.shields.io/badge/kernel%20driver-WDM-5C2D91)
@@ -14,13 +12,13 @@
 
 ---
 
-**Trinetra is an open-source Windows EDR that monitors endpoint activity through three independent sensors — Sysmon, kernel ETW, and a custom kernel-mode driver — and fuses their output to detect threats that any single sensor misses.**
+**Trinetra is an open-source Windows EDR that monitors endpoint activity through three independent sensors — Sysmon, kernel ETW, and a custom kernel-mode driver and fuses their output to detect threats that any single sensor misses.**
 
-Every Windows monitoring approach has gaps it cannot close on its own. Sysmon can be made to record the wrong parent process. ETW's kernel telemetry carries no command-line data — by design, regardless of configuration. Neither can intercept credential-access attempts against protected system processes before they happen. Attackers who understand these constraints can craft techniques that walk through any single-sensor deployment undetected.
+Every Windows monitoring approach has gaps it cannot close on its own. Sysmon can be made to record the wrong parent process. ETW's kernel telemetry carries no command-line data by design, regardless of configuration. Neither can intercept credential-access attempts against protected system processes before they happen. Attackers who understand these constraints can craft techniques that walk through any single-sensor deployment undetected.
 
-Trinetra's answer is correlation: run all three simultaneously, cross-check every event, and treat sensor disagreement as a detection in its own right. When ETW and Sysmon report the same process but claim different parents, a `[TELEMETRY_CONTRADICTION]` alert fires. When the kernel driver witnesses a process the ETW session never reported within a 5-second window, that's a `[SENSOR-BLINDSPOT]` — catching ETW session tampering per event, not on a 60-second heartbeat. The kernel driver also intercepts LSASS handle requests at the pre-operation stage, before the handle is granted and before Windows can block the observer — something Sysmon's EventID 10 structurally cannot do. The agent protects itself the same way: external handles to the Trinetra process are stripped of terminate and inject rights at the kernel, so `taskkill /F` fails before it lands. Every mitigation is preceded by a forensic snapshot of the full process ancestry chain — the evidence is captured before the process is gone. And the tool is honest about what it cannot see: a four-state health model qualifies every dashboard tile when a sensor degrades, so a quiet console genuinely means quiet, not blind.
+Trinetra's answer is correlation: run all three simultaneously, cross-check every event, and treat sensor disagreement as a detection in its own right. When ETW and Sysmon report the same process but claim different parents, a `[TELEMETRY_CONTRADICTION]` alert fires. When the kernel driver witnesses a process the ETW session never reported within a 5-second window, that's a `[SENSOR-BLINDSPOT]` catching ETW session tampering per event, not on a 60-second heartbeat. The kernel driver also intercepts LSASS handle requests at the pre-operation stage, before the handle is granted and before Windows can block the observer something Sysmon's EventID 10 structurally cannot do. The agent protects itself the same way: external handles to the Trinetra process are stripped of terminate and inject rights at the kernel, so `taskkill /F` fails before it lands. Every mitigation is preceded by a forensic snapshot of the full process ancestry chain the evidence is captured before the process is gone. And the tool is honest about what it cannot see: a four-state health model qualifies every dashboard tile when a sensor degrades, so a quiet console genuinely means quiet, not blind.
 
-In ablation testing on Windows 11 build 26100, no individual sensor detected more than 3 of 5 attack scenarios. **All three fused: 5/5.** The gaps are structural — not a configuration problem, not a tuning problem. Fusion is the only configuration that reaches full coverage.
+In ablation testing on Windows 11 build 26100, no individual sensor detected more than 3 of 5 attack scenarios. **All three fused: 5/5.** The gaps are structural not a configuration problem, not a tuning problem. Fusion is the only configuration that reaches full coverage.
 
 ---
 
