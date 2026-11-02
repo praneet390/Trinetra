@@ -140,11 +140,8 @@ def _sysmon_xml(pid, ppid):
 
 def _etw_event(pid, ppid):
     """The (event_id, event_dict) tuple pywintrace hands the ETW callback.
-    Field values are strings, matching the real decoder: pywintrace formats
-    every property through TdhFormatProperty and its int conversion is
-    guarded by `type(data) == int` on what is always a str, so it never
-    fires. (Sysmon's XML values are strings too, which is what lets
-    ProcessCorrelator's raw-pid key match across the two sensors.)"""
+    Field values are strings (pywintrace formats via TdhFormatProperty); Sysmon XML values
+    are strings too - that's what lets ProcessCorrelator's raw-pid key match across both."""
     return (1, {
         "Task Name": "ProcessStart",
         "ProcessID": str(pid),
@@ -298,9 +295,7 @@ class Lab:
         self.sysmon_queue = queue.Queue(maxsize=telemetry_monitor.EVENT_QUEUE_MAXSIZE)
         self.etw_queue = queue.Queue(maxsize=self.etw_queue_maxsize)
 
-        # The two scoring workers block forever on their queue and cannot be
-        # stopped; they are daemon threads that go idle (silent) when a
-        # scenario ends, which is harmless for a short-lived lab process.
+        # Scoring workers are daemon threads - they go idle when the scenario ends.
         if sysmon:
             self._spawn(telemetry_monitor._scoring_worker, self.engine, self.sysmon_queue)
         if etw:

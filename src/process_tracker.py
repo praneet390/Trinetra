@@ -1,51 +1,13 @@
 """
-In-memory parent/child process lineage + FULL ANCESTRY tracker.
+In-memory parent/child process lineage and full ancestry tracker.
 
-Two capabilities live in this module, one data structure:
-
-1. LINEAGE (original capability, Velociraptor's process-tracker pattern,
-   simplified): built incrementally from ProcessCreate events, resolving a
-   PID's ancestor chain by PID linkage (ParentProcessId) rather than by
-   parent image path. Feeds the web dashboard's Process Explorer "Lineage"
-   column via lineage_string(). Purely additive and display-only.
-
-2. ANCESTRY GRAPH (new): the same parent/child map, but resolved into
-   full evidence records instead of a display string. For every node in a
-   process's ancestry it captures - when the data exists -
-   PID, PPID, image path, command line, user, spawn time, the time this
-   agent first observed it, and (best-effort, live processes only) its
-   environment variables. Every parent->child edge is labeled with the
-   observation that connects the two (EXEC for a process-create link),
-   which is the reconstruction side of "the syscall that connected each
-   parent to child is labeled on the edge".
-
-WHY BOTH SHARE ONE STRUCTURE: the lineage column and the ancestry snapshot
-are the same graph at two fidelity levels. Splitting them would mean two
-trackers silently drifting out of sync; instead, lineage_string() is a thin
-projection of the same records get_ancestry() walks.
-
-DESIGN NOTES
-------------
-- Records are built from whatever the event source carries. Sysmon Event ID 1
-  is rich (CommandLine, User, ParentImage); raw ETW ProcessStart is thin
-  (PID/PPID/Image/CreateTime only - see etw_monitor.py). Missing fields are
-  stored as None, never guessed: an ancestry node with command_line=None is
-  an honest "ETW-only observation", not a bug.
-- Environment variables are read LAZILY, only when get_ancestry() is asked
-  for them (include_env=True), and only for processes that are still alive:
-  a process's environment lives in its address space, and once the process
-  exits it is unrecoverable. The result is cached per-PID (an env block
-  doesn't meaningfully change after startup), the cache is bounded, and any
-  psutil error (AccessDenied on protected/elevated processes, NoSuchProcess
-  on dead ones) degrades to env_vars=None plus a human-readable env_note -
-  an ancestry node must never fail to build because one ancestor was locked.
-- Bounded memory throughout: process entries and the env cache both evict
-  least-recently-updated entries past their caps, same ring-buffer spirit
-  as AlertStore/ProcessActivityStore in web_server.py.
-- Purely additive and display-only - never scores anything, never touches
-  HeuristicEngine scoring. The ENGINE decides when an ancestry snapshot is
-  forensic evidence (see heuristic_engine._capture_forensic_snapshot); this
-  module only answers questions when asked.
+lineage_string() and get_ancestry() are two projections of one graph: keeping
+them in one structure prevents silent drift. Records are built from whatever
+the event source carries (Sysmon Event ID 1 is rich; raw ETW is thin - see
+etw_monitor.py); missing fields are None, never guessed. Environment variables
+are read lazily per get_ancestry(include_env=True) and cached; they live in
+process address space and are unrecoverable after exit. Purely additive:
+never scores anything; HeuristicEngine decides when to ask for a snapshot.
 """
 
 import os
@@ -56,21 +18,12 @@ import psutil
 
 DEFAULT_MAX_ENTRIES = 2000
 DEFAULT_MAX_DEPTH = 10
-# Bound on the lazily-populated environment-variable cache. A live desktop
-# can have hundreds of processes; only ones that ever appear in an ancestry
-# query ever get an entry, so a few hundred entries is already generous.
 DEFAULT_MAX_ENV_CACHE = 512
 
 
 def _process_environ(pid):
-    """Read one live process's environment variables via psutil.
-
-    Isolated at module level so tests can monkeypatch it without spinning
-    real OS processes. Callers must treat this as BEST-EFFORT: it raises for
-    exited processes (NoSuchProcess) and for processes this account cannot
-    open (AccessDenied - elevated/protected processes on Windows), and both
-    are normal, expected outcomes that get_ancestry() reports honestly
-    instead of hiding."""
+    """Isolated at module level so tests can monkeypatch without real OS processes.
+    Raises NoSuchProcess (exited) or AccessDenied (elevated); both are expected."""
     return psutil.Process(pid).environ()
 
 
@@ -90,28 +43,13 @@ def _humanize_age(seconds):
 class ProcessTracker:
     def __init__(self, max_entries=DEFAULT_MAX_ENTRIES, max_env_cache=DEFAULT_MAX_ENV_CACHE):
         self.max_entries = max_entries
-        # pid -> evidence record. See add() for the record shape. OrderedDict
-        # so a bounded eviction can drop the least-recently-updated entry
-        # first, same "bounded ring buffer" spirit as AlertStore/
-        # ProcessActivityStore in web_server.py.
         self._entries = OrderedDict()
-        # pid -> environment-variable dict, populated lazily by
-        # get_ancestry(include_env=True). Bounded separately from the
-        # process records because env blocks are large (hundreds of vars).
         self._env_cache = OrderedDict()
         self.max_env_cache = max_env_cache
 
-    # ------------------------------------------------------------------
-    # Ingestion - one fan-in point for every ProcessCreate observation,
-    # whichever sensor delivered it (Sysmon Event ID 1, the correlator's
-    # fused dispatch, or an ETW-only provisional dispatch).
-    # ------------------------------------------------------------------
     def add(self, event_id, data):
-        """Record one ProcessCreate observation. Event IDs other than 1
-        (ProcessCreate) are ignored - this tracker is a process-tree map,
-        not a general event log. Fields the sensor didn't carry are stored
-        as None: an ETW-only dispatch has no CommandLine, and pretending
-        otherwise would poison the ancestry evidence."""
+        """Record one ProcessCreate (Event ID 1) observation; all others ignored.
+        Fields the sensor didn't carry are stored as None, never guessed."""
         if event_id != 1:  # ProcessCreate only
             return
         try:
@@ -125,18 +63,10 @@ class ProcessTracker:
         except (TypeError, ValueError):
             ppid = None
 
-        # Spawn time: prefer the OS-provided creation timestamp (ETW carries
-        # CreateTime; Sysmon's UtcTime is the event's own timestamp, close
-        # enough to spawn for ancestry-display purposes and the best Sysmon
-        # offers). Stored raw - the two sources use different formats, and
-        # this module renders rather than computes on it.
+        # ETW carries CreateTime; Sysmon carries UtcTime. Stored raw - formats differ.
         spawn_time = data.get('CreateTime') or data.get('UtcTime')
 
-        # Update-in-place on re-observation: a PID seen first via thin ETW
-        # and then via rich Sysmon (the correlator's provisional->fused
-        # sequence) ends up with the richer record. Per-field fill-in, so
-        # the fused dispatch upgrades exactly the fields it actually has
-        # instead of clobbering known values with None.
+        # Re-observation upgrades thin ETW records with richer Sysmon fields.
         existing = self._entries.get(pid)
         if existing is None:
             record = {
@@ -150,15 +80,8 @@ class ProcessTracker:
             }
             self._entries[pid] = record
         else:
-            # First-seen time (`ts`) is deliberately NOT refreshed on
-            # re-observation: it records when this agent first saw the
-            # process, which is exactly the dwell-time anchor downstream
-            # consumers want. Everything else may upgrade in place. Note
-            # the source-key mapping: record fields are lowercase, but the
-            # event data keys are the Sysmon-style originals - using the
-            # lowercase names here would silently find nothing and leave
-            # every ETW-first record permanently thin (caught by
-            # test_thin_etw_dispatch_upgraded_by_rich_sysmon_later).
+            # `ts` (first-seen) is never refreshed; it anchors dwell time.
+            # Keys use Sysmon-style originals (e.g. 'Image'), not lowercase field names.
             upgrade_sources = {
                 'image': data.get('Image'),
                 'command_line': data.get('CommandLine'),
@@ -170,9 +93,6 @@ class ProcessTracker:
                     existing[field] = new_value
             if existing.get('ppid') is None and ppid is not None:
                 existing['ppid'] = ppid
-            # Richer source wins for display (fused > etw > sysmon alone is
-            # not strictly ordered, so just prefer the fused label, which
-            # by construction carries the most fields).
             if data.get('_source') == 'fused':
                 existing['source'] = 'fused'
             self._entries.move_to_end(pid)
@@ -180,16 +100,9 @@ class ProcessTracker:
         while len(self._entries) > self.max_entries:
             self._entries.popitem(last=False)
 
-    # ------------------------------------------------------------------
-    # Resolution - two projections of the same parent/child map.
-    # ------------------------------------------------------------------
     def get_chain(self, pid, max_depth=DEFAULT_MAX_DEPTH):
-        """Image names from the oldest known ancestor down to `pid` itself
-        (inclusive), stopping at an untracked ancestor, a cycle, or
-        max_depth. Empty list if `pid` itself was never observed.
-
-        Backward-compatible projection: the dashboard's Lineage column and
-        the engine's compact chain-summary log line both consume this."""
+        """Image names oldest-first down to `pid`, stopping at an untracked ancestor,
+        cycle, or max_depth. Empty list if `pid` was never observed."""
         chain = []
         current = pid
         seen = set()
@@ -206,43 +119,14 @@ class ProcessTracker:
         return chain
 
     def lineage_string(self, pid, max_depth=DEFAULT_MAX_DEPTH):
-        """'explorer.exe -> cmd.exe -> evil.exe'-style summary for display,
-        basenames only (full paths would make the dashboard column
-        unreadably wide). Uses a separator-aware basename (Windows paths
-        use backslashes; this must render correctly wherever the dashboard
-        code runs, so split on BOTH separators rather than trusting
-        os.sep)."""
+        """'explorer.exe -> cmd.exe -> evil.exe' for dashboard display, basenames only."""
         names = [self._short_name(c) for c in self.get_chain(pid, max_depth=max_depth)]
         return ' -> '.join(names)
 
     def get_ancestry(self, pid, max_depth=DEFAULT_MAX_DEPTH, include_env=False):
-        """FULL ancestry evidence for `pid`: every known ancestor from the
-        oldest down to the process itself, as node records, plus the
-        labeled edges that connect them.
-
-        Returns:
-            {
-              'pid': <pid>,
-              'nodes': [ node, ... oldest-first, child LAST ],
-              'edges': [ {'from': <ppid>, 'to': <child pid>, 'label': 'EXEC'}, ... ],
-              'incomplete': <bool>  - True when the walk stopped early
-                                     (untracked ancestor / cycle / depth cap),
-                                     so consumers never mistake a partial
-                                     chain for a complete one.
-            }
-            None if `pid` itself was never observed.
-
-        Edge labels: every parent->child link in this tracker comes from a
-        ProcessCreate observation, so the honest label is 'EXEC' (the
-        creating syscall family). Injection-style connections (a process
-        OPENING another process's memory) are not parentage and are labeled
-        by the engine's forensic snapshot instead - see
-        heuristic_engine._capture_forensic_snapshot's trigger_edge.
-
-        include_env=True additionally best-effort-reads each still-alive
-        ancestor's environment block (see _process_environ). Dead ancestors
-        get env_vars=None + env_note explaining why - environment is process
-        memory, unrecoverable after exit."""
+        """Full ancestry evidence for `pid`: nodes oldest-first, labeled EXEC edges.
+        'incomplete' is True when the walk stopped early (untracked ancestor / cycle
+        / depth cap). include_env=True best-effort reads live environment blocks."""
         if pid not in self._entries:
             return None
 
@@ -252,8 +136,6 @@ class ProcessTracker:
         seen = set()
         incomplete = False
 
-        # Walk child -> oldest ancestor collecting nodes, then reverse so
-        # the list reads oldest-first (attack chains read top-down).
         while True:
             if current is None or current in seen:
                 incomplete = current is not None  # None = clean stop at root
@@ -314,16 +196,10 @@ class ProcessTracker:
         entry = self._entries.get(pid)
         return entry.get('ts') if entry else None
 
-    # ------------------------------------------------------------------
-    # Internals.
-    # ------------------------------------------------------------------
     @staticmethod
     def _short_name(path_or_name):
-        """Basename that understands BOTH Windows('\\') and POSIX('/')
-        separators. os.path.basename alone silently returns the whole
-        'C:\\a\\b.exe' string on POSIX, which would leak full paths into
-        the Lineage column and chain summaries depending on the OS this
-        code runs on."""
+        """Basename splitting on both '\\' and '/' - os.path.basename alone
+        returns the full path on POSIX for Windows-style paths."""
         if not isinstance(path_or_name, str):
             return path_or_name
         return path_or_name.replace('\\', '/').rsplit('/', 1)[-1]
@@ -353,10 +229,7 @@ class ProcessTracker:
             env = self._env_cache[pid]
             if env is not None:
                 return env, None
-            # Cached failure: the note that explained it was transient
-            # (e.g. process died mid-read) may have changed - re-derive
-            # cheaply rather than cache a stale excuse forever.
-            del self._env_cache[pid]
+            del self._env_cache[pid]  # re-derive; cached failures can become stale
 
         try:
             env = _process_environ(pid)

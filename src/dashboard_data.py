@@ -15,11 +15,7 @@ import psutil
 CRITICAL_THRESHOLD = 80
 WARNING_THRESHOLD = 50
 
-# Ordered (label, keywords) rules matched against a log message's text to
-# bucket it into the MITRE-ish technique categories already documented in
-# README's "What each detector actually catches" table. First match wins,
-# so more specific labels (Ransomware) are listed before ones their
-# messages could also collide with (Execution).
+# First match wins - more specific labels (Ransomware) before colliding ones (Execution).
 CATEGORY_RULES = (
     ("Sensor Visibility", ("sensor-blindspot",)),
     ("Telemetry Contradiction", ("telemetry_contradiction",)),
@@ -33,34 +29,17 @@ CATEGORY_RULES = (
     ("Execution", ("staging directory", "lolbin", "macro dropper", "powershell", "obfuscated", "keylogger")),
 )
 
-# Prefixes for pure lifecycle/status log lines - never keyword-categorized.
-# Without this, a custom rule pack's own metadata (its `id`/`name`, echoed
-# back verbatim in the "[RULES] Loaded custom rule '<id>'..." startup
-# announcement) can coincidentally contain a category keyword - e.g. a rule
-# id containing "lolbin" made a one-time "rule loaded" log line show up as
-# an "Execution" technique hit on the dashboard's chart, even though
-# nothing was ever detected. A rule *firing* (logged with a different
-# prefix, "[TELEMETRY]"/"[STATIC]") still gets categorized normally - only
-# messages that were never a finding in the first place are exempted here.
-#
-# [ALLOWLIST] belongs in this set for the same underlying reason, not a new
-# one: its message embeds the *suppressed* finding's own text (e.g.
-# "...Would-be: +40 (... Keylogger/Exfil pattern)") purely for operator
-# context, but nothing was actually detected on this system - it was
-# overridden as known-good. Counting it toward a technique's tally would
-# make the chart claim a live finding that a human already vetted away.
+# Lifecycle/status prefixes - never keyword-categorized. A rule id containing
+# "lolbin" made "[RULES] Loaded..." show up as an Execution hit on the chart.
+# [ALLOWLIST] excluded for the same reason: its message embeds the suppressed
+# finding's text but nothing was actually detected.
 NON_FINDING_PREFIXES = ('[RULES]', '[ALLOWLIST]', '[*]', '[+]', '[-]', '[!]')
 
 
 def severity_of(record: logging.LogRecord) -> str:
-    """Map a stdlib log record to the CRITICAL/WARNING/INFO buckets the
-    dashboard displays and charts. Only actual security-critical events
-    (a mitigation threshold crossing, or a safety-floor refusal to
-    mitigate a protected process) count as CRITICAL - a plain
-    logging.error() (Sysmon subscribe failed, a malformed event failed to
-    parse, etc.) is an operational hiccup, not an active threat, so it's
-    scored as WARNING. Conflating the two would bury real detections in
-    startup/plumbing noise in the dashboard's Critical tile and feed."""
+    """Map a stdlib log record to CRITICAL/WARNING/INFO.
+    logging.error() is an operational hiccup (subscribe failed, parse error),
+    not an active threat - scored WARNING to avoid burying real detections."""
     msg = record.getMessage()
     if record.levelno >= logging.CRITICAL or "[CRITICAL THREAT]" in msg or "[REFUSED]" in msg:
         return "CRITICAL"
@@ -80,8 +59,7 @@ def categorize(message: str) -> str:
 
 
 def build_process_rows(engine):
-    """(pid, name, score, verdict) for every currently-scored PID, highest
-    score first."""
+    """(pid, name, score, verdict) for every currently-scored PID."""
     rows = []
     for pid, score in engine.process_scores.items():
         try:
@@ -101,8 +79,7 @@ def build_process_rows(engine):
 
 def build_static_rows(engine, binaries_path):
     """(file, hash, score, verdict) for every statically-scanned sample.
-    Engine only keys static_scores by hash, so filenames are recovered from
-    the same binaries.json the scanner already read."""
+    Filenames recovered from binaries.json because static_scores is keyed by hash."""
     filenames = {}
     try:
         with open(binaries_path, 'r') as f:
@@ -132,9 +109,7 @@ def build_static_rows(engine, binaries_path):
 
 
 def bucket_alerts(alerts, minutes=20, now=None):
-    """Per-minute CRITICAL/WARNING/INFO counts for the trailing `minutes`
-    window ending now - feeds the Falcon-style detections-over-time chart.
-    `alerts` items need a `ts` (epoch seconds) and `severity` key."""
+    """Per-minute CRITICAL/WARNING/INFO counts for the trailing `minutes` window."""
     now = time.time() if now is None else now
     now_minute = int(now // 60)
     start_minute = now_minute - (minutes - 1)

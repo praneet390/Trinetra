@@ -1,30 +1,13 @@
 """
-Fuses matching Sysmon + ETW process-create events for the same real OS
-process so detection gets ETW's low latency immediately (a *provisional*
-dispatch, thin fields) and Sysmon's richer fields shortly after (a *fused*
-dispatch), while neither sensor's independent operation depends on the
-other - if one sensor is down, the other's events still reach the engine
-on their own.
+Fuses matching Sysmon + ETW process-create events for the same real process: ETW dispatches a
+provisional finding immediately (low latency, thin fields) and Sysmon's richer fields produce a
+fused dispatch shortly after. Each sensor operates independently; the other still works if one is down.
 
-Join key: pid alone, not (pid, create_time) as originally sketched. Each
-sensor's create_time arrives in a different, not reliably comparable
-shape - confirmed by reading pywintrace's source: every ETW field is
-decoded through TdhFormatProperty, and TDH_OUTTYPE_DATETIME (the out-type
-for a FILETIME field like CreateTime) has no entry in tdh.py's
-TDH_CONVERTER_LOOKUP, so it comes back as a locale-formatted datetime
-*string*, not a number - while Sysmon's UtcTime is a same-process fixed
-format but a different one. Rounding-and-comparing two unverified string
-formats across sensors would either crash outright or silently fail to
-match. Keying on pid alone, with a per-pid `first_seen` timer that bounds
-how long a pending record waits before GC, correlates two near-simultaneous
-arrivals for the same real process correctly and needs no cross-sensor
-timestamp parsing at all. This accepts the same order-of-magnitude
-PID-reuse race window (bounded by fuse_window, default 2s) that
-heuristic_engine.py's _reset_score_if_pid_reused already documents as a
-known, accepted edge case elsewhere in this codebase - a PID reused by an
-unrelated process *within* fuse_window of the first process's exit could
-wrongly fuse; a PID reused after GC has already popped the record (the
-common case, one full fuse_window later) correctly starts a fresh record.
+Join key: pid alone, not (pid, create_time). ETW's CreateTime is a locale-formatted datetime string
+(TDH_OUTTYPE_DATETIME has no entry in pywintrace's TDH_CONVERTER_LOOKUP, confirmed by reading the
+source); Sysmon's UtcTime is a different fixed format. Cross-sensor timestamp comparison would
+silently fail to match. Keying on pid + fuse_window GC is correct and needs no timestamp parsing.
+Accepted edge case: a PID reused within fuse_window could wrongly fuse (same as _reset_score_if_pid_reused).
 """
 
 import logging
@@ -80,9 +63,7 @@ def _coerce_pid(value):
     from any real pid."""
     if value is None or isinstance(value, bool):
         return None
-    # A float is only a pid if it is exactly integral (int(1.5) would
-    # silently become pid 1; int(inf) raises OverflowError; nan is neither).
-    if isinstance(value, float) and not value.is_integer():
+    if isinstance(value, float) and not value.is_integer():  # int(1.5) would silently become pid 1
         return None
     try:
         pid = int(value)
@@ -92,39 +73,14 @@ def _coerce_pid(value):
 
 
 def _normalize_pid(pid):
-    """Canonicalizes a pid to int for use as _pending's dict key and as
-    _dedup_key. Found necessary during evasion-matrix testing (reports/
-    evasion_matrix.md), one level deeper than the missing-_dedup_key bug
-    that testing also found on submit_kernel (fixed separately, below):
-    the THREE sensors hand this correlator inconsistent Python types for
-    the exact same real numeric pid.
-
-    - kernel_sensor.py's struct.unpack always gives a genuine int.
-    - HeuristicEngine.evaluate_event()'s XML parsing reads 'ProcessId'
-      straight from an ElementTree Data element's .text - always a str,
-      never cast.
-    - etw_monitor.py's pywintrace-decoded 'ProcessID' LOOKS like it should
-      be an int (tdh.py's TDH_CONVERTER_LOOKUP maps the UNSIGNEDINT out-
-      type to int()) but isn't in practice: etw.py's own conversion site
-      only calls that converter when `type(data) == int` already - a
-      no-op precondition, since TdhFormatProperty itself returns a
-      formatted str, so the "conversion" to int never actually fires.
-      Confirmed by reading etw/etw.py's _parseExtendedData in this
-      project's own .venv.
-
-    Without normalizing, int 1234 and str '1234' are different dict
-    keys - two _pending records for the SAME real process that never
-    fuse (silently reverting every process-create to two independent
-    etw-provisional + sysmon-only dispatches instead of one fused one,
-    and skipping _check_ancestry_contradiction entirely for that pid),
-    and two separate _score_once dedup buckets that never dedupe each
-    other. In practice ETW and Sysmon's values happen to both be str
-    today (so ETW/Sysmon fusion mostly still works, by accident, riding
-    on pywintrace's own bug above - fragile, not something to rely on),
-    while the kernel sensor's genuine int never matched either of them -
-    confirmed live: a kernel-observed process also matching a
-    Sysmon-only rule (e.g. staging_dir) was scored twice even after
-    submit_kernel's _dedup_key fix, because int 1234 != str '1234'."""
+    """Canonicalize a pid to int so all three sensors use the same dict key.
+    The three sensors give inconsistent Python types for the same numeric pid:
+    kernel=int (struct.unpack), Sysmon=str (XML .text, never cast),
+    ETW=str in practice (pywintrace's int() converter is a no-op because
+    TdhFormatProperty returns a str, confirmed by reading etw/etw.py._parseExtendedData).
+    Without this: int 1234 != str '1234' means no fusion and double-scoring.
+    Confirmed live: kernel-observed staging_dir process was scored twice after the
+    submit_kernel _dedup_key fix, because int 1234 != str '1234' bypassed dedup."""
     try:
         return int(pid)
     except (TypeError, ValueError, OverflowError):
@@ -152,11 +108,8 @@ class ProcessCorrelator:
         # reported it), 'etw_creator', 'kernel_creator', 'image'}. Insertion
         # order == first_seen order, which _gc_witness relies on.
         self._witness = OrderedDict()
-        # pid -> clock time its record was settled. A witness arriving for a
-        # pid settled less than 2*witness_window ago is a LATE arrival for a
-        # creation already judged, not a new creation: without this, a
-        # lagging ETW event would first count as "ETW missed it" and then
-        # open a second record that counts as "the kernel missed it".
+        # pid -> settled time. A late arrival within 2*witness_window is for a creation already judged,
+        # not a new one: prevents a lagging ETW event from counting as "ETW missed it" then re-opening.
         self._closed = OrderedDict()
         self._witness_gate = None       # callable(sensor_name) -> bool; None == check disabled
         self._witness_armed_at = None
